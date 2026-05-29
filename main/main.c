@@ -5,6 +5,7 @@
 #include "nvs_flash.h"
 
 #include "discovery_service.h"
+#include "http_server.h"
 #include "log_server.h"
 #include "network_init.h"
 #include "usb_backend.h"
@@ -32,6 +33,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(network_init_start());
     ESP_ERROR_CHECK(log_server_start());
+    ESP_ERROR_CHECK(http_server_start());
     ESP_ERROR_CHECK(usb_backend_start());
 #if CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER
     ESP_ERROR_CHECK(virtual_perfetto_logic_start());

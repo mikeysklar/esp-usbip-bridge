@@ -8,6 +8,7 @@ set(srcs
     "usb_backend.c"
     "log_server.c"
     "usbip_server.c"
+    "http_server.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
