@@ -1,5 +1,5 @@
 set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns
-                   harness_io harness_scpi harness_dut)
+                   harness_io harness_scpi harness_dut harness_io_expander)
 
 set(srcs
     "main.c"
@@ -26,6 +26,7 @@ if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER)
 endif()
 
 if(CONFIG_USBIP_VIRTUAL_HARNESS)
+    list(APPEND req_components harness_io_expander harness_gpio harness_bus)
     list(APPEND srcs
         "virtual_harness.c"
     )
@@ -40,5 +41,5 @@ endif()
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."
-    REQUIRES ${req_components}
+    PRIV_REQUIRES ${req_components}
 )

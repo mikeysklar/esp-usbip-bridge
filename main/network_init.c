@@ -78,16 +78,55 @@ static esp_err_t network_init_ethernet(void)
     emac_config.smi_gpio.mdc_num = CONFIG_USBIP_ETH_MDC_GPIO;
     emac_config.smi_gpio.mdio_num = CONFIG_USBIP_ETH_MDIO_GPIO;
 
+    // Override RMII clock configuration
+#if CONFIG_USBIP_ETH_RMII_CLK_MODE == 0
+    emac_config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
+#else
+    emac_config.clock_config.rmii.clock_mode = EMAC_CLK_OUT;
+#endif
+    emac_config.clock_config.rmii.clock_gpio = CONFIG_USBIP_ETH_RMII_CLK_GPIO;
+
+    // Override RMII data plane GPIOs (ESP32-P4 uses multi-IOMUX)
+    emac_config.emac_dataif_gpio.rmii.tx_en_num = CONFIG_USBIP_ETH_RMII_TX_EN_GPIO;
+    emac_config.emac_dataif_gpio.rmii.txd0_num = CONFIG_USBIP_ETH_RMII_TXD0_GPIO;
+    emac_config.emac_dataif_gpio.rmii.txd1_num = CONFIG_USBIP_ETH_RMII_TXD1_GPIO;
+    emac_config.emac_dataif_gpio.rmii.crs_dv_num = CONFIG_USBIP_ETH_RMII_CRS_DV_GPIO;
+    emac_config.emac_dataif_gpio.rmii.rxd0_num = CONFIG_USBIP_ETH_RMII_RXD0_GPIO;
+    emac_config.emac_dataif_gpio.rmii.rxd1_num = CONFIG_USBIP_ETH_RMII_RXD1_GPIO;
+
+    ESP_LOGI(TAG,
+             "EMAC config: interface=%d clock_mode=%d clock_gpio=%d "
+             "MDC=%d MDIO=%d PHY_ADDR=%d RST=%d "
+             "TX_EN=%d TXD0=%d TXD1=%d CRS_DV=%d RXD0=%d RXD1=%d",
+             emac_config.interface,
+             emac_config.clock_config.rmii.clock_mode,
+             emac_config.clock_config.rmii.clock_gpio,
+             emac_config.smi_gpio.mdc_num,
+             emac_config.smi_gpio.mdio_num,
+             phy_config.phy_addr,
+             phy_config.reset_gpio_num,
+             emac_config.emac_dataif_gpio.rmii.tx_en_num,
+             emac_config.emac_dataif_gpio.rmii.txd0_num,
+             emac_config.emac_dataif_gpio.rmii.txd1_num,
+             emac_config.emac_dataif_gpio.rmii.crs_dv_num,
+             emac_config.emac_dataif_gpio.rmii.rxd0_num,
+             emac_config.emac_dataif_gpio.rmii.rxd1_num);
+
+    ESP_LOGI(TAG, "Creating EMAC MAC instance...");
+
     esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac_config, &mac_config);
     if (mac == NULL) {
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG, "Creating PHY instance...");
 
     esp_eth_phy_t *phy = esp_eth_phy_new_generic(&phy_config);
     if (phy == NULL) {
         return ESP_FAIL;
     }
 
+    ESP_LOGI(TAG, "Installing Ethernet driver...");
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
     err = esp_eth_driver_install(&eth_config, &eth_handle);
@@ -95,11 +134,13 @@ static esp_err_t network_init_ethernet(void)
         return err;
     }
 
+    ESP_LOGI(TAG, "Attaching netif...");
     err = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
     if (err != ESP_OK) {
         return err;
     }
 
+    ESP_LOGI(TAG, "Starting Ethernet...");
     err = esp_eth_start(eth_handle);
     if (err != ESP_OK) {
         return err;

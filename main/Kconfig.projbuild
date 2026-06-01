@@ -1,5 +1,41 @@
 menu "USB/IP Bridge Configuration"
 
+choice USBIP_BOARD
+    prompt "Target board"
+    default USBIP_BOARD_ESPRESSIF_ESP32P4_FUNCTION_EV if IDF_TARGET_ESP32P4
+    default USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG if IDF_TARGET_ESP32S3
+    help
+        Select the target hardware board.  This selects pin mappings,
+        transport defaults, and board-specific GPIO configurations.
+        Board names follow CircuitPython conventions.
+
+        Each board option auto-selects the corresponding pin table in
+        the esp-harness subsystem.
+
+    config USBIP_BOARD_NONE
+        bool "none"
+
+    config USBIP_BOARD_ESPRESSIF_ESP32P4_FUNCTION_EV
+        bool "espressif_esp32p4_function_ev"
+        depends on IDF_TARGET_ESP32P4
+
+    config USBIP_BOARD_ESPRESSIF_ESP32P4X_FUNCTION_EV
+        bool "espressif_esp32p4x_function_ev"
+        depends on IDF_TARGET_ESP32P4
+
+    config USBIP_BOARD_M5STACK_POE_P4
+        bool "m5stack_poe_p4"
+        depends on IDF_TARGET_ESP32P4
+
+    config USBIP_BOARD_P4HIL_BOARD
+        bool "p4hil_board"
+        depends on IDF_TARGET_ESP32P4
+
+    config USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG
+        bool "espressif_esp32s3_usb_otg"
+        depends on IDF_TARGET_ESP32S3
+endchoice
+
 choice USBIP_TRANSPORT
     prompt "Network transport"
     default USBIP_TRANSPORT_ETHERNET if IDF_TARGET_ESP32P4
@@ -33,6 +69,43 @@ config USBIP_ETH_PHY_RST_GPIO
     int "Ethernet PHY reset GPIO (-1 to disable)"
     default 51
 
+config USBIP_ETH_RMII_CLK_MODE
+    int "RMII clock mode (0=EXT_IN, 1=EXT_OUT)"
+    range 0 1
+    default 0
+    help
+        0 = EMAC_CLK_EXT_IN: External 50 MHz oscillator on RMII clock GPIO.
+        1 = EMAC_CLK_OUT:  P4 generates 50 MHz from internal PLL, outputs
+            on clock GPIO, and routes it back to an input GPIO externally.
+
+config USBIP_ETH_RMII_CLK_GPIO
+    int "RMII clock GPIO"
+    default 50
+
+config USBIP_ETH_RMII_TX_EN_GPIO
+    int "RMII TX_EN GPIO"
+    default 49
+
+config USBIP_ETH_RMII_TXD0_GPIO
+    int "RMII TXD0 GPIO"
+    default 34
+
+config USBIP_ETH_RMII_TXD1_GPIO
+    int "RMII TXD1 GPIO"
+    default 35
+
+config USBIP_ETH_RMII_CRS_DV_GPIO
+    int "RMII CRS_DV GPIO"
+    default 28
+
+config USBIP_ETH_RMII_RXD0_GPIO
+    int "RMII RXD0 GPIO"
+    default 29
+
+config USBIP_ETH_RMII_RXD1_GPIO
+    int "RMII RXD1 GPIO"
+    default 30
+
 endif
 
 if USBIP_TRANSPORT_WIFI
@@ -62,6 +135,22 @@ config USBIP_WIFI_DISABLE_MODEM_SLEEP
         Keeps Wi-Fi radio fully active after association. This increases power
         usage but improves latency and avoids Wi-Fi power-save side effects
         during USB host bridging.
+
+endif
+
+if USBIP_BOARD_P4HIL_BOARD
+
+config USBIP_P4HIL_USB_POWER_ENABLE
+    bool "Enable P4HIL USB host power GPIO setup"
+    default y
+    help
+        Configure the USB_POWER_ON GPIO high to enable VBUS power
+        on the P4HIL board.
+
+config USBIP_P4HIL_USB_POWER_GPIO
+    int "P4HIL USB power GPIO"
+    default 27
+    depends on USBIP_P4HIL_USB_POWER_ENABLE
 
 endif
 

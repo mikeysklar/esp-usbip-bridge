@@ -12,7 +12,7 @@ BOARD="${1:-}"
 ACTION="build"
 
 if [[ -z "${BOARD}" ]]; then
-    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|s3-usb-otg> [build|flash|monitor|clean]" >&2
+    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|p4hil|s3-usb-otg> [build|flash|monitor|clean]" >&2
     exit 1
 fi
 
@@ -40,6 +40,12 @@ case "${BOARD}" in
         BUILD_DIR="build-s3-usb-otg"
         SDKCONFIG_FILE="sdkconfig.s3-usb-otg"
         DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.s3-usb-otg"
+        ;;
+    p4hil)
+        TARGET="esp32p4"
+        BUILD_DIR="build-p4hil"
+        SDKCONFIG_FILE="sdkconfig.p4hil"
+        DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.p4hil"
         ;;
     *)
         echo "Unknown board: ${BOARD}" >&2

@@ -22,6 +22,7 @@
 #include "board_pins.h"
 #include "usb_backend.h"
 #include "virtual_device.h"
+#include "harness_io_expander.h"
 
 #define HTTP_PORT              80
 #define HTTP_MAX_CLIENTS       4
@@ -119,7 +120,7 @@ static void stream_end(stream_t *s)
 }
 
 /* ─────────────────────────────────────────────
- *  GPIO helpers
+ *  GPIO / IO-expander helpers
  * ───────────────────────────────────────────── */
 
 typedef struct {
@@ -129,18 +130,147 @@ typedef struct {
 
 #define MAX_DUT_PINS 64
 static pin_entry_t s_dut_pins[MAX_DUT_PINS];
+
+/* IO expander I2C bus pins (board-specific, p4hil: SDA=35, SCL=36) */
+#define IO_EXPANDER_SDA  35
+#define IO_EXPANDER_SCL  36
+
 static int s_dut_pin_count;
+
+/* Expander state */
+static bool s_expander_inited = false;
+static bool s_expander_present = false;   /* true if expander was found at init */
+
+static void init_io_expander(void)
+{
+    esp_err_t err = harness_io_expander_init(
+        IO_EXPANDER_SDA, IO_EXPANDER_SCL,
+        IO_EXPANDER_DEFAULT_ADDR, 100000);
+    if (err == ESP_OK) {
+        s_expander_inited = true;
+        s_expander_present = true;
+        ESP_LOGI(TAG, "PI4IOE5V9535 at 0x%02x (SDA=%d, SCL=%d)",
+                 IO_EXPANDER_DEFAULT_ADDR, IO_EXPANDER_SDA, IO_EXPANDER_SCL);
+    } else {
+        s_expander_inited = false;
+        s_expander_present = false;
+    }
+}
+
+/* Extract expander pin index from label "E5" -> 5 */
+static int expander_pin_from_label(const char *label)
+{
+    if ((label[0] == 'E' || label[0] == 'e') && label[1]) {
+        int n;
+        if (sscanf(label + 1, "%d", &n) == 1 && n >= 0 && n < IO_EXPANDER_PIN_COUNT)
+            return n;
+    }
+    return -1;
+}
+
+/* Read a pin: native GPIO if gpio>=0, otherwise expander */
+static int read_gpio_safe(int8_t gpio, const char *label)
+{
+    if (gpio >= 0) return gpio_get_level(gpio);
+    int epin = expander_pin_from_label(label);
+    if (epin < 0 || !s_expander_inited) return -1;
+    return harness_io_expander_read_pin((uint8_t)epin);
+}
+
+static bool config_pin_output(pin_entry_t *pin)
+{
+    if (pin->gpio >= 0) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = 1ULL << pin->gpio,
+            .mode = GPIO_MODE_INPUT_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        esp_err_t err = gpio_config(&cfg);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "GPIO %s -> output", pin->label);
+        }
+        return err == ESP_OK;
+    }
+    int epin = expander_pin_from_label(pin->label);
+    if (epin < 0 || !s_expander_inited) return false;
+    esp_err_t err = harness_io_expander_set_dir((uint8_t)epin, false);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Expander %s -> output", pin->label);
+    }
+    return err == ESP_OK;
+}
+
+static bool config_pin_input(pin_entry_t *pin)
+{
+    if (pin->gpio >= 0) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = 1ULL << pin->gpio,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        esp_err_t err = gpio_config(&cfg);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "GPIO %s -> input", pin->label);
+        }
+        return err == ESP_OK;
+    }
+    int epin = expander_pin_from_label(pin->label);
+    if (epin < 0 || !s_expander_inited) return false;
+    esp_err_t err = harness_io_expander_set_dir((uint8_t)epin, true);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Expander %s -> input", pin->label);
+    }
+    return err == ESP_OK;
+}
+
+static bool set_pin_level(pin_entry_t *pin, int level)
+{
+    if (pin->gpio >= 0) {
+        gpio_set_level(pin->gpio, level);
+        ESP_LOGI(TAG, "GPIO %s = %d", pin->label, level);
+        return true;
+    }
+    int epin = expander_pin_from_label(pin->label);
+    if (epin < 0 || !s_expander_inited) return false;
+    esp_err_t err = harness_io_expander_write_pin((uint8_t)epin, level != 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Expander %s = %d", pin->label, level);
+    }
+    return err == ESP_OK;
+}
+
+/* ─────────────────────────────────────────────
+ *  Pin table construction
+ * ───────────────────────────────────────────── */
 
 static void collect_dut_pins(void)
 {
     size_t count;
     const board_pin_t *pins = board_get_pins(&count);
     s_dut_pin_count = 0;
+
+    /* Collect native DUT header pins (T* and B*) */
     for (size_t i = 0; i < count && s_dut_pin_count < MAX_DUT_PINS; i++) {
         const char *l = pins[i].label;
         if ((l[0] == 'T' || l[0] == 'B') && l[1] >= '1' && l[1] <= '9') {
             s_dut_pins[s_dut_pin_count].label = pins[i].label;
             s_dut_pins[s_dut_pin_count].gpio  = pins[i].gpio;
+            s_dut_pin_count++;
+        }
+    }
+
+    /* Collect IO expander pins (E0-E15) if available */
+    if (s_expander_present) {
+        for (int i = 0; i < IO_EXPANDER_PIN_COUNT && s_dut_pin_count < MAX_DUT_PINS; i++) {
+            char *label = malloc(8);
+            if (!label) break;
+            snprintf(label, 8, "E%d", i);
+            s_dut_pins[s_dut_pin_count].label = label;
+            s_dut_pins[s_dut_pin_count].gpio  = -1;
             s_dut_pin_count++;
         }
     }
@@ -155,44 +285,8 @@ static pin_entry_t *find_pin_by_label(const char *label)
     return NULL;
 }
 
-static int read_gpio_safe(int8_t gpio)
-{
-    if (gpio < 0) return -1;
-    return gpio_get_level(gpio);
-}
-
-static bool config_pin_output(pin_entry_t *pin)
-{
-    if (pin->gpio < 0) return false;
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin->gpio,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    return gpio_config(&cfg) == ESP_OK;
-}
-
-static bool config_pin_input(pin_entry_t *pin)
-{
-    if (pin->gpio < 0) return false;
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin->gpio,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    return gpio_config(&cfg) == ESP_OK;
-}
-
 /* ─────────────────────────────────────────────
- *  JSON helpers (small, keep buffer-based)
- * ───────────────────────────────────────────── */
-
-/* ─────────────────────────────────────────────
- *  JSON helpers (small, keep buffer-based)
+ *  JSON helpers
  * ───────────────────────────────────────────── */
 
 typedef struct {
@@ -225,7 +319,7 @@ static void build_pins_json(char *buf, size_t buf_size)
     int off = 0;
     off += snprintf(buf + off, buf_size - off, "{\"pins\":[");
     for (int i = 0; i < s_dut_pin_count; i++) {
-        int val = read_gpio_safe(s_dut_pins[i].gpio);
+        int val = read_gpio_safe(s_dut_pins[i].gpio, s_dut_pins[i].label);
         off += snprintf(buf + off, buf_size - off,
             "%c{\"name\":\"%s\",\"gpio\":%d,\"value\":%d}",
             (i > 0) ? ',' : ' ',
@@ -347,7 +441,7 @@ static void stream_html_page(stream_t *s)
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
         "</div>\n"
         "<div id=\"sp\" class=\"sec on\">\n"
-        "<h2>DUT Header Pins (T1&ndash;T19 / B1&ndash;B20)</h2>\n"
+        "<h2>DUT Header Pins</h2>\n"
         "<table><thead><tr><th>Pin</th><th>GPIO</th><th>Value</th>"
         "<th>Dir</th><th>Action</th></tr></thead><tbody>\n",
         board_get_name(), s_dut_pin_count);
@@ -355,20 +449,34 @@ static void stream_html_page(stream_t *s)
     /* Stream each pin row */
     for (int i = 0; i < s_dut_pin_count; i++) {
         const pin_entry_t *pin = &s_dut_pins[i];
-        int val = read_gpio_safe(pin->gpio);
+        int val = read_gpio_safe(pin->gpio, pin->label);
         if (val < 0) val = 0;
         const char *cls = val ? "hi" : "lo";
-        stream_printf(s,
-            "<tr><td><strong>%s</strong></td><td>GPIO%d</td>"
-            "<td class=\"%s\" id=\"v%s\">%s</td>"
-            "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
-            "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
-            "</select></td>"
-            "<td><button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
-            pin->label, pin->gpio,
-            cls, pin->label, val ? "HIGH" : "LOW",
-            pin->label, pin->label,
-            pin->label);
+        if (pin->gpio < 0) {
+            stream_printf(s,
+                "<tr><td><strong>%s</strong></td><td>Exp</td>"
+                "<td class=\"%s\" id=\"v%s\">%s</td>"
+                "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
+                "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
+                "</select></td>"
+                "<td><button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
+                pin->label,
+                cls, pin->label, val ? "HIGH" : "LOW",
+                pin->label, pin->label,
+                pin->label);
+        } else {
+            stream_printf(s,
+                "<tr><td><strong>%s</strong></td><td>GPIO%d</td>"
+                "<td class=\"%s\" id=\"v%s\">%s</td>"
+                "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
+                "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
+                "</select></td>"
+                "<td><button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
+                pin->label, pin->gpio,
+                cls, pin->label, val ? "HIGH" : "LOW",
+                pin->label, pin->label,
+                pin->label);
+        }
     }
 
     stream_printf(s,
@@ -406,23 +514,45 @@ static void stream_html_page(stream_t *s)
         "</tbody></table></div>\n"
         "<footer>USB/IP Bridge &mdash; <a href=\"/\" style=\"color:#555\">refresh</a></footer>\n"
         "<script>\n"
-        "function st(n){['p','u'].forEach(function(x){"
+        "function rp(){"
+        "var x=new XMLHttpRequest();"
+        "x.open('GET','/api/pins',true);"
+        "x.onload=function(){"
+        "if(x.status==200){"
+        "var r=JSON.parse(x.responseText);"
+        "r.pins.forEach(function(p){"
+        "var e=document.getElementById('v'+p.name);"
+        "if(e){"
+        "e.textContent=p.value?'HIGH':'LOW';"
+        "e.className=p.value?'hi':'lo'"
+        "}"
+        "})"
+        "}"
+        "};"
+        "x.send()"
+        "}\n"
+        "function st(n){"
+        "['p','u'].forEach(function(x){"
         "document.getElementById('t'+x).className='';"
-        "document.getElementById('s'+x).className='sec'});"
+        "document.getElementById('s'+x).className='sec'"
+        "});"
         "document.getElementById('t'+n).className='on';"
-        "document.getElementById('s'+n).className='sec on'}\n"
-        "function sd(p){var d=document.getElementById('d'+p).value;"
+        "document.getElementById('s'+n).className='sec on'"
+        "}\n"
+        "function sd(p){"
+        "var d=document.getElementById('d'+p).value;"
         "var x=new XMLHttpRequest();"
         "x.open('POST','/api/pins/'+p,true);"
         "x.setRequestHeader('Content-Type','application/json');"
-        "x.send(JSON.stringify({direction:d}))}\n"
-        "function tg(p){var x=new XMLHttpRequest();"
-        "x.onload=function(){if(x.status==200){"
-        "var r=JSON.parse(x.responseText);"
-        "var e=document.getElementById('v'+p);"
-        "e.textContent=r.value?'HIGH':'LOW';"
-        "e.className=r.value?'hi':'lo'}};"
-        "x.open('POST','/api/pins/'+p+'/toggle',true);x.send()}\n"
+        "x.onload=function(){if(x.status==200){rp()}};"
+        "x.send(JSON.stringify({direction:d}))"
+        "}\n"
+        "function tg(p){"
+        "var x=new XMLHttpRequest();"
+        "x.onload=function(){if(x.status==200){rp()}};"
+        "x.open('POST','/api/pins/'+p+'/toggle',true);"
+        "x.send()"
+        "}\n"
         "</script>\n"
         "</body></html>\n");
 }
@@ -470,9 +600,9 @@ static void handle_post_pin(int fd, const char *pin_name,
         if (strcmp(direction, "in") == 0) config_pin_input(pin);
         else if (strcmp(direction, "out") == 0) config_pin_output(pin);
     }
-    if (new_val >= 0) gpio_set_level(pin->gpio, new_val);
+    if (new_val >= 0) set_pin_level(pin, new_val);
 
-    int level = read_gpio_safe(pin->gpio);
+    int level = read_gpio_safe(pin->gpio, pin->label);
     if (level < 0) level = 0;
     char resp[128];
     int rlen = snprintf(resp, sizeof(resp),
@@ -578,10 +708,10 @@ static void handle_connection(int fd)
             pin_entry_t *pin = find_pin_by_label(pname);
             if (!pin) { free(body_buf); free(buf); http_404(fd); return; }
 
-            int level = read_gpio_safe(pin->gpio);
+            int level = read_gpio_safe(pin->gpio, pin->label);
             if (level < 0) level = 0;
-            gpio_set_level(pin->gpio, level ? 0 : 1);
-            level = read_gpio_safe(pin->gpio);
+            set_pin_level(pin, level ? 0 : 1);
+            level = read_gpio_safe(pin->gpio, pin->label);
             if (level < 0) level = 0;
 
             char resp[128];
@@ -611,6 +741,7 @@ static void http_server_task(void *arg)
 {
     (void)arg;
 
+    init_io_expander();
     collect_dut_pins();
     ESP_LOGI(TAG, "Found %d DUT pins on board \"%s\"",
              s_dut_pin_count, board_get_name());

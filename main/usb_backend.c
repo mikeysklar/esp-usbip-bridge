@@ -22,6 +22,10 @@
 #include "driver/gpio.h"
 #endif
 
+#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_USBIP_P4HIL_USB_POWER_ENABLE
+#include "driver/gpio.h"
+#endif
+
 #define USB_BACKEND_EVENT_QUEUE_LEN 16
 #define USB_BACKEND_TASK_STACK 8192
 #define USB_BACKEND_TASK_PRIORITY 9
@@ -125,6 +129,36 @@ static esp_err_t usb_backend_s3_usb_otg_devkit_power_init(void)
              CONFIG_USBIP_S3_USB_DEV_VBUS_EN_GPIO,
              CONFIG_USBIP_S3_USB_LIMIT_EN_GPIO,
              CONFIG_USBIP_S3_USB_SEL_GPIO);
+    return ESP_OK;
+}
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_USBIP_P4HIL_USB_POWER_ENABLE
+static esp_err_t usb_backend_p4hil_usb_power_init(void)
+{
+    const uint64_t pin_mask = (1ULL << CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
+
+    gpio_config_t io_conf = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG,
+             "Enabling P4HIL USB host power on GPIO %d...",
+             CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
+
+    gpio_set_level(CONFIG_USBIP_P4HIL_USB_POWER_GPIO, 1);
+
+    ESP_LOGI(TAG,
+             "P4HIL USB host power enabled on GPIO %d",
+             CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
     return ESP_OK;
 }
 #endif
@@ -780,6 +814,13 @@ esp_err_t usb_backend_start(void)
     esp_err_t board_power_err = usb_backend_s3_usb_otg_devkit_power_init();
     if (board_power_err != ESP_OK) {
         return board_power_err;
+    }
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_USBIP_P4HIL_USB_POWER_ENABLE
+    esp_err_t p4hil_power_err = usb_backend_p4hil_usb_power_init();
+    if (p4hil_power_err != ESP_OK) {
+        return p4hil_power_err;
     }
 #endif
 
