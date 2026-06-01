@@ -171,10 +171,17 @@ static int expander_pin_from_label(const char *label)
 /* Read a pin: native GPIO if gpio>=0, otherwise expander */
 static int read_gpio_safe(int8_t gpio, const char *label)
 {
-    if (gpio >= 0) return gpio_get_level(gpio);
-    int epin = expander_pin_from_label(label);
-    if (epin < 0 || !s_expander_inited) return -1;
-    return harness_io_expander_read_pin((uint8_t)epin);
+    int val;
+    if (gpio >= 0) {
+        val = gpio_get_level(gpio);
+        ESP_LOGI(TAG, "read pin %s (GPIO%d) = %d", label, gpio, val);
+    } else {
+        int epin = expander_pin_from_label(label);
+        if (epin < 0 || !s_expander_inited) return -1;
+        val = harness_io_expander_read_pin((uint8_t)epin);
+        ESP_LOGI(TAG, "read pin %s (Exp%d) = %d", label, epin, val);
+    }
+    return val;
 }
 
 static bool config_pin_output(pin_entry_t *pin)
@@ -274,6 +281,32 @@ static void collect_dut_pins(void)
             s_dut_pin_count++;
         }
     }
+}
+
+/* Configure every DUT pin as an input on startup, so gpio_get_level()
+   reads the external pin level rather than a stale output latch from
+   a previous SCPI or UI session. */
+static void init_dut_pin_directions(void)
+{
+    for (int i = 0; i < s_dut_pin_count; i++) {
+        if (s_dut_pins[i].gpio >= 0) {
+            gpio_config_t cfg = {
+                .pin_bit_mask = 1ULL << s_dut_pins[i].gpio,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            gpio_config(&cfg);
+        } else {
+            /* Expander pin — set as input via the expander driver. */
+            int epin = expander_pin_from_label(s_dut_pins[i].label);
+            if (epin >= 0 && s_expander_inited) {
+                harness_io_expander_set_dir((uint8_t)epin, true);
+            }
+        }
+    }
+    ESP_LOGI(TAG, "Configured all %d DUT pins as inputs", s_dut_pin_count);
 }
 
 static pin_entry_t *find_pin_by_label(const char *label)
@@ -459,11 +492,12 @@ static void stream_html_page(stream_t *s)
                 "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
                 "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
                 "</select></td>"
-                "<td><button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
+                "<td><button onclick=\"rr('%s')\">Read</button>"
+                "<button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
                 pin->label,
                 cls, pin->label, val ? "HIGH" : "LOW",
                 pin->label, pin->label,
-                pin->label);
+                pin->label, pin->label);
         } else {
             stream_printf(s,
                 "<tr><td><strong>%s</strong></td><td>GPIO%d</td>"
@@ -471,11 +505,12 @@ static void stream_html_page(stream_t *s)
                 "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
                 "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
                 "</select></td>"
-                "<td><button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
+                "<td><button onclick=\"rr('%s')\">Read</button>"
+                "<button onclick=\"tg('%s')\">Toggle</button></td></tr>\n",
                 pin->label, pin->gpio,
                 cls, pin->label, val ? "HIGH" : "LOW",
                 pin->label, pin->label,
-                pin->label);
+                pin->label, pin->label);
         }
     }
 
@@ -553,6 +588,21 @@ static void stream_html_page(stream_t *s)
         "x.open('POST','/api/pins/'+p+'/toggle',true);"
         "x.send()"
         "}\n"
+        "function rr(p){"
+        "var x=new XMLHttpRequest();"
+        "x.open('GET','/api/pins/'+p,true);"
+        "x.onload=function(){"
+        "if(x.status==200){"
+        "var r=JSON.parse(x.responseText);"
+        "var e=document.getElementById('v'+p);"
+        "if(e){"
+        "e.textContent=r.value?'HIGH':'LOW';"
+        "e.className=r.value?'hi':'lo'"
+        "}"
+        "}"
+        "};"
+        "x.send()"
+        "}\n"
         "</script>\n"
         "</body></html>\n");
 }
@@ -560,6 +610,19 @@ static void stream_html_page(stream_t *s)
 /* ─────────────────────────────────────────────
  *  Request routing
  * ───────────────────────────────────────────── */
+
+static void handle_get_pin(int fd, const char *pin_name)
+{
+    pin_entry_t *pin = find_pin_by_label(pin_name);
+    if (!pin) { http_404(fd); return; }
+    int level = read_gpio_safe(pin->gpio, pin->label);
+    if (level < 0) level = 0;
+    char resp[128];
+    int rlen = snprintf(resp, sizeof(resp),
+        "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d}",
+        pin->label, pin->gpio, level);
+    send_json_ok(fd, resp, rlen);
+}
 
 static void handle_post_pin(int fd, const char *pin_name,
                             const char *body, size_t body_len)
@@ -692,9 +755,14 @@ static void handle_connection(int fd)
         return;
     }
 
-    /* POST /api/pins/<name>[/toggle] */
+    /* GET or POST /api/pins/<name>[/toggle] */
     const char *rest = path_after(url, "/api/pins/");
     if (rest) {
+        if (strcmp(req.method, "GET") == 0) {
+            handle_get_pin(fd, rest);
+            free(body_buf); free(buf);
+            return;
+        }
         if (strcmp(req.method, "POST") != 0) { free(body_buf); free(buf); http_405(fd); return; }
 
         const char *slash = strchr(rest, '/');
@@ -743,6 +811,7 @@ static void http_server_task(void *arg)
 
     init_io_expander();
     collect_dut_pins();
+    init_dut_pin_directions();
     ESP_LOGI(TAG, "Found %d DUT pins on board \"%s\"",
              s_dut_pin_count, board_get_name());
 

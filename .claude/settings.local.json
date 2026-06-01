@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:components-file.espressif.com)",
+      "WebSearch",
+      "WebFetch(domain:docs.m5stack.com)",
+      "WebFetch(domain:docs.espressif.com)",
+      "WebFetch(domain:static-cdn.m5stack.com)",
+      "Bash(make build:*)",
+      "Bash(make BOARD=m5stack-poe-p4 build)",
+      "Bash(make BOARD=m5stack-poe-p4 clean)",
+      "Bash(cp /home/tannewt/repos/esp32p4-usbip/managed_components/espressif__usb/src/ext_port.c /home/tannewt/repos/esp-usb/host/usb/src/ext_port.c)",
+      "Bash(cp /home/tannewt/repos/esp32p4-usbip/managed_components/espressif__usb/src/ext_hub.c /home/tannewt/repos/esp-usb/host/usb/src/ext_hub.c)",
+      "Bash(make BOARD=m5stack-poe-p4)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}
