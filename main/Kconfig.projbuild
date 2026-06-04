@@ -214,6 +214,14 @@ config USBIP_NUM_PIPES
         Number of concurrent USB transfer request slots.  Should match the
         DWC host controller channel count (16 for ESP32-P4, 8 for ESP32-S3).
 
+config USBIP_NEOPIXEL_GPIO
+    int "Neopixel data GPIO"
+    default 0
+    help
+        GPIO connected to a WS2812-compatible neopixel.  Set to -1 to disable.
+        When the HTTP UI is loaded the neopixel briefly shows white as a
+        visual indicator.
+
 endmenu
 
 menu "Virtual Logic Capture Configuration"

@@ -9,6 +9,8 @@ set(srcs
     "log_server.c"
     "usbip_server.c"
     "http_server.c"
+    "led_strip_encoder.c"
+    "neopixel.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
@@ -37,6 +39,9 @@ if(IDF_TARGET STREQUAL "esp32p4")
 elseif(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND req_components esp_wifi esp_driver_gpio)
 endif()
+
+# Always compiled; neopixel_init() becomes a no-op when gpio < 0.
+list(APPEND req_components esp_driver_rmt)
 
 idf_component_register(
     SRCS ${srcs}

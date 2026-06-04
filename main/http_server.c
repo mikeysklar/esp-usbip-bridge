@@ -13,8 +13,10 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
@@ -23,6 +25,9 @@
 #include "usb_backend.h"
 #include "virtual_device.h"
 #include "harness_io_expander.h"
+#include "harness_dut.h"
+
+#include "neopixel.h"
 
 #define HTTP_PORT              80
 #define HTTP_MAX_CLIENTS       4
@@ -353,10 +358,14 @@ static void build_pins_json(char *buf, size_t buf_size)
     off += snprintf(buf + off, buf_size - off, "{\"pins\":[");
     for (int i = 0; i < s_dut_pin_count; i++) {
         int val = read_gpio_safe(s_dut_pins[i].gpio, s_dut_pins[i].label);
+        char wire_name[HARNESS_DUT_MAX_LABEL_LEN + 1];
+        if (!harness_dut_get_wire(s_dut_pins[i].label, wire_name, sizeof(wire_name))) {
+            wire_name[0] = '\0';
+        }
         off += snprintf(buf + off, buf_size - off,
-            "%c{\"name\":\"%s\",\"gpio\":%d,\"value\":%d}",
+            "%c{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"wire\":\"%s\"}",
             (i > 0) ? ',' : ' ',
-            s_dut_pins[i].label, s_dut_pins[i].gpio, val);
+            s_dut_pins[i].label, s_dut_pins[i].gpio, val, wire_name);
         if ((size_t)off >= buf_size) break;
     }
     off += snprintf(buf + off, buf_size - off, "]}");
@@ -364,18 +373,23 @@ static void build_pins_json(char *buf, size_t buf_size)
 
 static void build_devices_json(char *buf, size_t buf_size)
 {
-    usbip_backend_device_t devs[CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX];
-    size_t count = usb_backend_get_devices(devs, sizeof(devs) / sizeof(devs[0]));
+    size_t devs_max = CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX;
+    usbip_backend_device_t *devs = malloc(devs_max * sizeof(usbip_backend_device_t));
+    size_t count = 0;
     int off = 0;
     off += snprintf(buf + off, buf_size - off, "{\"devices\":[");
-    for (size_t i = 0; i < count; i++) {
-        off += snprintf(buf + off, buf_size - off,
-            "%c{\"busid\":\"%s\",\"vendor\":\"0x%04x\",\"product\":\"0x%04x\","
-            "\"bcdDevice\":\"0x%04x\",\"speed\":%lu,\"class\":\"0x%02x\"}",
-            (i > 0) ? ',' : ' ',
-            devs[i].busid, devs[i].id_vendor, devs[i].id_product,
-            devs[i].bcd_device, (unsigned long)devs[i].speed, devs[i].device_class);
-        if ((size_t)off >= buf_size) break;
+    if (devs) {
+        count = usb_backend_get_devices(devs, devs_max);
+        for (size_t i = 0; i < count; i++) {
+            off += snprintf(buf + off, buf_size - off,
+                "%c{\"busid\":\"%s\",\"vendor\":\"0x%04x\",\"product\":\"0x%04x\","
+                "\"bcdDevice\":\"0x%04x\",\"speed\":%lu,\"class\":\"0x%02x\"}",
+                (i > 0) ? ',' : ' ',
+                devs[i].busid, devs[i].id_vendor, devs[i].id_product,
+                devs[i].bcd_device, (unsigned long)devs[i].speed, devs[i].device_class);
+            if ((size_t)off >= buf_size) break;
+        }
+        free(devs);
     }
     off += snprintf(buf + off, buf_size - off, "]}");
 }
@@ -460,6 +474,8 @@ static void stream_html_page(stream_t *s)
         ".tabs button.on{background:#e94560;border-color:#e94560}\n"
         ".sec{display:none}\n"
         ".sec.on{display:block}\n"
+        "input.dut-wire{background:#0f3460;color:#eee;border:1px solid #555;"
+        "padding:2px 4px;border-radius:3px;font-size:0.75rem;width:80px}\n"
         "footer{text-align:center;color:#555;margin-top:20px;font-size:0.7rem}\n"
         "@media(max-width:600px){th,td{padding:3px 5px;font-size:0.7rem}}\n"
         "</style>\n"
@@ -476,7 +492,7 @@ static void stream_html_page(stream_t *s)
         "<div id=\"sp\" class=\"sec on\">\n"
         "<h2>DUT Header Pins</h2>\n"
         "<table><thead><tr><th>Pin</th><th>GPIO</th><th>Value</th>"
-        "<th>Dir</th><th>Action</th></tr></thead><tbody>\n",
+        "<th>DUT Name</th><th>Dir</th><th>Action</th></tr></thead><tbody>\n",
         board_get_name(), s_dut_pin_count);
 
     /* Stream each pin row */
@@ -489,6 +505,7 @@ static void stream_html_page(stream_t *s)
             stream_printf(s,
                 "<tr><td><strong>%s</strong></td><td>Exp</td>"
                 "<td class=\"%s\" id=\"v%s\">%s</td>"
+                "<td><input id=\"w%s\" type=\"text\" class=\"dut-wire\" size=\"6\"></td>"
                 "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
                 "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
                 "</select></td>"
@@ -502,6 +519,7 @@ static void stream_html_page(stream_t *s)
             stream_printf(s,
                 "<tr><td><strong>%s</strong></td><td>GPIO%d</td>"
                 "<td class=\"%s\" id=\"v%s\">%s</td>"
+                "<td><input id=\"w%s\" type=\"text\" class=\"dut-wire\" size=\"6\"></td>"
                 "<td><select id=\"d%s\" onchange=\"sd('%s')\">"
                 "<option value=\"in\">IN</option><option value=\"out\">OUT</option>"
                 "</select></td>"
@@ -521,22 +539,27 @@ static void stream_html_page(stream_t *s)
         "<table><thead><tr><th>BusID</th><th>Vendor</th><th>Product</th>"
         "<th>Speed</th><th>Class</th></tr></thead><tbody>\n");
 
-    /* Stream USB devices */
+    /* Stream USB devices (heap-allocated to avoid ~5KB stack pressure) */
     {
-        usbip_backend_device_t devs[CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX];
-        size_t dc = usb_backend_get_devices(devs, sizeof(devs) / sizeof(devs[0]));
-        for (size_t i = 0; i < dc; i++) {
-            const char *sp = "?";
-            switch (devs[i].speed) {
-                case 1: sp = "Low";  break;
-                case 2: sp = "Full"; break;
-                case 3: sp = "High"; break;
+        size_t devs_max = CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX;
+        usbip_backend_device_t *devs = malloc(devs_max * sizeof(usbip_backend_device_t));
+        size_t dc = 0;
+        if (devs) {
+            dc = usb_backend_get_devices(devs, devs_max);
+            for (size_t i = 0; i < dc; i++) {
+                const char *sp = "?";
+                switch (devs[i].speed) {
+                    case 1: sp = "Low";  break;
+                    case 2: sp = "Full"; break;
+                    case 3: sp = "High"; break;
+                }
+                stream_printf(s,
+                    "<tr><td>%s</td><td>%04x</td><td>%04x</td>"
+                    "<td>%s</td><td>0x%02x</td></tr>\n",
+                    devs[i].busid, devs[i].id_vendor, devs[i].id_product,
+                    sp, devs[i].device_class);
             }
-            stream_printf(s,
-                "<tr><td>%s</td><td>%04x</td><td>%04x</td>"
-                "<td>%s</td><td>0x%02x</td></tr>\n",
-                devs[i].busid, devs[i].id_vendor, devs[i].id_product,
-                sp, devs[i].device_class);
+            free(devs);
         }
         if (dc == 0) {
             stream_printf(s,
@@ -560,6 +583,11 @@ static void stream_html_page(stream_t *s)
         "if(e){"
         "e.textContent=p.value?'HIGH':'LOW';"
         "e.className=p.value?'hi':'lo'"
+        "}"
+        "var w=document.getElementById('w'+p.name);"
+        "if(w){"
+        "w.value=p.wire;"
+        "w.onchange=function(){sw(this)};"
         "}"
         "})"
         "}"
@@ -603,8 +631,40 @@ static void stream_html_page(stream_t *s)
         "};"
         "x.send()"
         "}\n"
+        "function sw(elem){"
+        "var p=elem.id.replace(/^w/,'');"
+        "var x=new XMLHttpRequest();"
+        "x.open('POST','/api/pins/'+p,true);"
+        "x.setRequestHeader('Content-Type','application/json');"
+        "x.onload=function(){if(x.status==200){rp()}};"
+        "x.send(JSON.stringify({wire:elem.value}))"
+        "}\n"
         "</script>\n"
         "</body></html>\n");
+}
+
+/* ─────────────────────────────────────────────
+ *  Neopixel helpers
+ * ───────────────────────────────────────────── */
+
+/* Timer handle to turn the neopixel off after 10 seconds. */
+static esp_timer_handle_t s_neopixel_timer = NULL;
+
+static void neopixel_off_cb(void *arg)
+{
+    (void)arg;
+    neopixel_off();
+}
+
+static void neopixel_show_white_10s(void)
+{
+    neopixel_set_rgb(255, 255, 255);
+
+    /* Start or restart the 10-second off timer. */
+    if (s_neopixel_timer) {
+        esp_timer_stop(s_neopixel_timer);
+        esp_timer_start_once(s_neopixel_timer, 10 * 1000000); /* 10 seconds in µs */
+    }
 }
 
 /* ─────────────────────────────────────────────
@@ -617,10 +677,14 @@ static void handle_get_pin(int fd, const char *pin_name)
     if (!pin) { http_404(fd); return; }
     int level = read_gpio_safe(pin->gpio, pin->label);
     if (level < 0) level = 0;
-    char resp[128];
+    char wire_name[HARNESS_DUT_MAX_LABEL_LEN + 1];
+    if (!harness_dut_get_wire(pin->label, wire_name, sizeof(wire_name))) {
+        wire_name[0] = '\0';
+    }
+    char resp[256];
     int rlen = snprintf(resp, sizeof(resp),
-        "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d}",
-        pin->label, pin->gpio, level);
+        "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"wire\":\"%s\"}",
+        pin->label, pin->gpio, level, wire_name);
     send_json_ok(fd, resp, rlen);
 }
 
@@ -633,6 +697,8 @@ static void handle_post_pin(int fd, const char *pin_name,
 
     int new_val = -1;
     char direction[8] = {0};
+    char wire[HARNESS_DUT_MAX_LABEL_LEN + 1] = {0};
+    bool has_wire = false;
 
     const char *vk = strstr(body, "\"value\"");
     if (vk) {
@@ -659,18 +725,42 @@ static void handle_post_pin(int fd, const char *pin_name,
         }
     }
 
+    const char *wk = strstr(body, "\"wire\"");
+    if (wk) {
+        const char *c = strchr(wk, ':');
+        if (c) {
+            const char *q1 = strchr(c, '"');
+            if (q1) {
+                const char *q2 = strchr(q1 + 1, '"');
+                if (q2 && (size_t)(q2 - q1 - 1) < sizeof(wire)) {
+                    memcpy(wire, q1 + 1, q2 - q1 - 1);
+                    wire[q2 - q1 - 1] = '\0';
+                    has_wire = true;
+                }
+            }
+        }
+    }
+
     if (direction[0]) {
         if (strcmp(direction, "in") == 0) config_pin_input(pin);
         else if (strcmp(direction, "out") == 0) config_pin_output(pin);
     }
     if (new_val >= 0) set_pin_level(pin, new_val);
 
+    if (has_wire) {
+        harness_dut_set_wire(pin->label, wire);
+    }
+
     int level = read_gpio_safe(pin->gpio, pin->label);
     if (level < 0) level = 0;
-    char resp[128];
+    char wire_name[HARNESS_DUT_MAX_LABEL_LEN + 1];
+    if (!harness_dut_get_wire(pin->label, wire_name, sizeof(wire_name))) {
+        wire_name[0] = '\0';
+    }
+    char resp[256];
     int rlen = snprintf(resp, sizeof(resp),
-        "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d}",
-        pin->label, pin->gpio, level);
+        "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"wire\":\"%s\"}",
+        pin->label, pin->gpio, level, wire_name);
     send_json_ok(fd, resp, rlen);
 }
 
@@ -725,6 +815,7 @@ static void handle_connection(int fd)
 
     /* GET / — stream the HTML page */
     if (strcmp(url, "/") == 0 && strcmp(req.method, "GET") == 0) {
+        neopixel_show_white_10s();
         stream_t s;
         stream_begin(&s, fd, "text/html; charset=utf-8");
         stream_html_page(&s);
@@ -814,6 +905,27 @@ static void http_server_task(void *arg)
     init_dut_pin_directions();
     ESP_LOGI(TAG, "Found %d DUT pins on board \"%s\"",
              s_dut_pin_count, board_get_name());
+
+    /* Initialise neopixel (if configured). */
+    {
+        int np_gpio = CONFIG_USBIP_NEOPIXEL_GPIO;
+        if (np_gpio >= 0) {
+            esp_err_t err = neopixel_init(np_gpio);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Neopixel on GPIO %d", np_gpio);
+                /* Create a one-shot timer to turn neopixel off after 10 s. */
+                esp_timer_create_args_t tmr = {
+                    .callback = neopixel_off_cb,
+                    .name = "neopxl_off",
+                };
+                esp_timer_create(&tmr, &s_neopixel_timer);
+            } else {
+                ESP_LOGW(TAG, "Neopixel init failed: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGI(TAG, "Neopixel disabled");
+        }
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (fd < 0) {
