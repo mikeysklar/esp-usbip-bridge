@@ -13,6 +13,7 @@
 #include "mdns.h"
 #include "sdkconfig.h"
 
+#include "device_naming.h"
 #include "usb_backend.h"
 #include "usbip_protocol.h"
 
@@ -135,11 +136,11 @@ esp_err_t discovery_service_start(void)
         return err;
     }
 
-    char hostname[32];
-    snprintf(hostname, sizeof(hostname), "usbip-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    char hostname[DEVICE_NAME_MAX_LEN];
+    device_naming_get_hostname(hostname, sizeof(hostname));
 
-    char instance[48];
-    snprintf(instance, sizeof(instance), "ESP USB/IP Bridge (%s)", CONFIG_IDF_TARGET);
+    char instance[DEVICE_NAME_MAX_LEN + 32];
+    snprintf(instance, sizeof(instance), "%s (%s)", hostname, CONFIG_IDF_TARGET);
 
     err = mdns_init();
     if (err != ESP_OK) {
@@ -194,6 +195,7 @@ esp_err_t discovery_service_start(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local", USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
+    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local",
+             USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
     return ESP_OK;
 }

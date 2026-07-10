@@ -23,7 +23,7 @@
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_USBIP_P4HIL_USB_POWER_ENABLE
-#include "driver/gpio.h"
+#include "harness_io_expander.h"
 #endif
 
 #define USB_BACKEND_EVENT_QUEUE_LEN 16
@@ -136,29 +136,32 @@ static esp_err_t usb_backend_s3_usb_otg_devkit_power_init(void)
 #if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_USBIP_P4HIL_USB_POWER_ENABLE
 static esp_err_t usb_backend_p4hil_usb_power_init(void)
 {
-    const uint64_t pin_mask = (1ULL << CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
+    int exp_idx = CONFIG_USBIP_P4HIL_USB_POWER_EXPANDER_IDX;
+    int pin     = CONFIG_USBIP_P4HIL_USB_POWER_EXPANDER_PIN;
 
-    gpio_config_t io_conf = {
-        .pin_bit_mask = pin_mask,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    esp_err_t err = gpio_config(&io_conf);
+    if (!harness_io_expander_is_initialized()) {
+        ESP_LOGE(TAG, "IO expander not initialised, cannot enable USB power");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Set the expander pin as output, high */
+    esp_err_t err = harness_io_expander_set_dir(exp_idx, (uint8_t)pin, false);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Exp%d[%d] as output: %s",
+                 exp_idx, pin, esp_err_to_name(err));
+        return err;
+    }
+
+    err = harness_io_expander_write_pin(exp_idx, (uint8_t)pin, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Exp%d[%d] high: %s",
+                 exp_idx, pin, esp_err_to_name(err));
         return err;
     }
 
     ESP_LOGI(TAG,
-             "Enabling P4HIL USB host power on GPIO %d...",
-             CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
-
-    gpio_set_level(CONFIG_USBIP_P4HIL_USB_POWER_GPIO, 1);
-
-    ESP_LOGI(TAG,
-             "P4HIL USB host power enabled on GPIO %d",
-             CONFIG_USBIP_P4HIL_USB_POWER_GPIO);
+             "P4HIL USB host power enabled on Exp%d[%d]",
+             exp_idx, pin);
     return ESP_OK;
 }
 #endif

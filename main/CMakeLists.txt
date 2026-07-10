@@ -3,6 +3,7 @@ set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns
 
 set(srcs
     "main.c"
+    "device_naming.c"
     "discovery_service.c"
     "network_init.c"
     "usb_backend.c"
@@ -47,4 +48,19 @@ idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."
     PRIV_REQUIRES ${req_components}
+    EMBED_TXTFILES "web_app.js"
 )
+
+# Syntax-check the embedded browser JS at build time when node is available.
+# This is best-effort: hosts without node simply skip the check so CI and
+# local builds stay portable.  Run `node --check main/web_app.js` manually
+# to validate when node is absent.
+find_program(NODE_JS node)
+if(NODE_JS)
+    add_custom_target(main_jscheck
+        COMMAND "${NODE_JS}" --check "${CMAKE_CURRENT_SOURCE_DIR}/web_app.js"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web_app.js"
+        COMMENT "Syntax-checking web_app.js"
+        VERBATIM)
+    add_dependencies(${COMPONENT_LIB} main_jscheck)
+endif()

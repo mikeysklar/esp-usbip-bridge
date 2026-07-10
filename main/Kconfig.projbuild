@@ -141,16 +141,29 @@ endif
 if USBIP_BOARD_P4HIL_BOARD
 
 config USBIP_P4HIL_USB_POWER_ENABLE
-    bool "Enable P4HIL USB host power GPIO setup"
+    bool "Enable P4HIL USB host power via IO expander"
     default y
     help
-        Configure the USB_POWER_ON GPIO high to enable VBUS power
-        on the P4HIL board.
+        Set an IO expander pin high to enable VBUS power on the P4HIL board.
+        USB_POWER_ON is now on an IO expander (not a direct GPIO).
 
-config USBIP_P4HIL_USB_POWER_GPIO
-    int "P4HIL USB power GPIO"
-    default 27
+config USBIP_P4HIL_USB_POWER_EXPANDER_IDX
+    int "P4HIL USB power IO expander index"
+    default 1
+    range 0 2
     depends on USBIP_P4HIL_USB_POWER_ENABLE
+    help
+        Which IO expander (0, 1, or 2) the USB_POWER_ON signal is connected to.
+        On the P4HIL board USB_POWER_ON is wired to expander 1, pin 15 (E1_15).
+
+config USBIP_P4HIL_USB_POWER_EXPANDER_PIN
+    int "P4HIL USB power IO expander pin"
+    default 15
+    range 0 15
+    depends on USBIP_P4HIL_USB_POWER_ENABLE
+    help
+        Pin number on the IO expander for USB_POWER_ON.  E0_0..E0_5 are the
+        external connector — do not use them for USB power.
 
 endif
 
