@@ -100,13 +100,25 @@ function rr(p) {
   x.send();
 }
 
-/* Save a DUT wire name typed into a pin row. */
+/* Save a DUT wire name typed into a pin row.  Updates only the saved
+   pin's value display from the response instead of calling rp(), which
+   would overwrite every wire input field and could clear a name the user
+   is still typing in another row. */
 function sw(elem) {
   var p = elem.id.replace(/^w/, '');
   var x = new XMLHttpRequest();
   x.open('POST', '/api/pins/' + p, true);
   x.setRequestHeader('Content-Type', 'application/json');
-  x.onload = function () { if (x.status == 200) { rp(); } };
+  x.onload = function () {
+    if (x.status == 200) {
+      var r = JSON.parse(x.responseText);
+      var e = document.getElementById('v' + p);
+      if (e) {
+        e.textContent = r.value ? 'HIGH' : 'LOW';
+        e.className = r.value ? 'hi' : 'lo';
+      }
+    }
+  };
   x.send(JSON.stringify({ wire: elem.value }));
 }
 
@@ -146,6 +158,42 @@ function hc() {
   document.getElementById('hn-cancel').style.display = 'none';
 }
 
+/* Board ID editing inline UI. */
+function be() {
+  var h = document.getElementById('board_id');
+  var inp = document.getElementById('bi-input');
+  inp.value = h.textContent;
+  h.style.display = 'none';
+  inp.style.display = 'inline';
+  document.getElementById('bi-edit').style.display = 'none';
+  document.getElementById('bi-save').style.display = 'inline';
+  document.getElementById('bi-cancel').style.display = 'inline';
+  inp.focus();
+  inp.select();
+}
+
+function bs() {
+  var inp = document.getElementById('bi-input');
+  var x = new XMLHttpRequest();
+  x.open('POST', '/api/board_id', true);
+  x.setRequestHeader('Content-Type', 'application/json');
+  x.onload = function () {
+    if (x.status == 200) {
+      document.getElementById('board_id').textContent = inp.value;
+      bc();
+    }
+  };
+  x.send(JSON.stringify({ board_id: inp.value }));
+}
+
+function bc() {
+  document.getElementById('board_id').style.display = 'inline';
+  document.getElementById('bi-input').style.display = 'none';
+  document.getElementById('bi-edit').style.display = 'inline';
+  document.getElementById('bi-save').style.display = 'none';
+  document.getElementById('bi-cancel').style.display = 'none';
+}
+
 /* Config export: GET /api/config and download as <hostname>-config.json. */
 function cfgExport() {
   var x = new XMLHttpRequest();
@@ -165,43 +213,107 @@ function cfgExport() {
   x.send();
 }
 
-/* Config import: open the hidden file picker. */
-function cfgImportBtn() {
-  document.getElementById('cfgFile').click();
+/* Config import: create a temporary file input, click it, and POST
+   the selected file to /api/config. */
+function cfgImport() {
+  var inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'application/json,.json';
+  inp.style.display = 'none';
+  inp.onchange = function () {
+    if (!inp.files || !inp.files[0]) return;
+    var f = inp.files[0];
+    var fr = new FileReader();
+    fr.onload = function () {
+      var x = new XMLHttpRequest();
+      x.open('POST', '/api/config', true);
+      x.setRequestHeader('Content-Type', 'application/json');
+      x.onload = function () {
+        if (x.status != 200) {
+          alert('Import failed: HTTP ' + x.status);
+          return;
+        }
+        var r;
+        try { r = JSON.parse(x.responseText); } catch (e) {}
+        if (r && r.error) {
+          alert('Import failed: ' + r.error);
+          return;
+        }
+        var msg = 'Config imported.';
+        if (r) {
+          msg = 'Config imported (' + r.applied + ' wires applied, ' +
+                r.skipped + ' skipped).';
+        }
+        alert(msg + ' Reloading...');
+        location.reload();
+      };
+      x.send(fr.result);
+    };
+    fr.readAsText(f);
+  };
+  document.body.appendChild(inp);
+  inp.click();
+  setTimeout(function () { inp.remove(); }, 100);
 }
 
-/* Config import: read the chosen file and POST it to /api/config. */
-function cfgImportFile(inp) {
-  if (!inp.files || !inp.files[0]) return;
-  var f = inp.files[0];
-  var fr = new FileReader();
-  fr.onload = function () {
+/* Hold-to-confirm clear config: user must hold the button for 3 seconds. */
+var cfgClearTimer = null;
+var cfgClearStartTime = 0;
+var cfgClearHeld = false;
+var CLEAR_HOLD_MS = 3000;
+
+function cfgClearStart(e) {
+  if (cfgClearTimer) return;
+  /* Prevent default to avoid text selection etc. */
+  e.preventDefault();
+  cfgClearHeld = true;
+  cfgClearStartTime = Date.now();
+  var btn = document.getElementById('cfgClearBtn');
+  if (btn) {
+    btn.style.transition = 'none';
+    btn.style.backgroundSize = '0% 100%';
+    /* Force reflow so the 0-size takes effect before the transition starts. */
+    btn.offsetHeight;
+    btn.style.transition = 'background-size ' + CLEAR_HOLD_MS + 'ms linear';
+    btn.style.backgroundSize = '100% 100%';
+  }
+  cfgClearTimer = setTimeout(function () {
+    if (!cfgClearHeld) return;
+    cfgClearHeld = false;
+    cfgClearTimer = null;
     var x = new XMLHttpRequest();
-    x.open('POST', '/api/config', true);
+    x.open('POST', '/api/config/clear', true);
     x.setRequestHeader('Content-Type', 'application/json');
     x.onload = function () {
-      if (x.status != 200) {
-        alert('Import failed: HTTP ' + x.status);
-        return;
+      if (x.status == 200) {
+        location.reload();
+      } else {
+        alert('Clear failed: HTTP ' + x.status);
+        var btn2 = document.getElementById('cfgClearBtn');
+        if (btn2) { btn2.style.transition = 'none'; btn2.style.backgroundSize = '0% 100%'; }
       }
-      var r;
-      try { r = JSON.parse(x.responseText); } catch (e) {}
-      if (r && r.error) {
-        alert('Import failed: ' + r.error);
-        return;
-      }
-      var msg = 'Config imported.';
-      if (r) {
-        msg = 'Config imported (' + r.applied + ' wires applied, ' +
-              r.skipped + ' skipped).';
-      }
-      alert(msg + ' Reloading...');
-      location.reload();
     };
-    x.send(fr.result);
-  };
-  fr.readAsText(f);
-  inp.value = '';
+    x.onerror = function () {
+      alert('Clear failed: network error');
+      var btn2 = document.getElementById('cfgClearBtn');
+      if (btn2) { btn2.style.transition = 'none'; btn2.style.backgroundSize = '0% 100%'; }
+    };
+    x.send();
+  }, CLEAR_HOLD_MS);
+}
+
+function cfgClearCancel() {
+  if (!cfgClearHeld) return;
+  cfgClearHeld = false;
+  if (cfgClearTimer) {
+    clearTimeout(cfgClearTimer);
+    cfgClearTimer = null;
+  }
+  var btn = document.getElementById('cfgClearBtn');
+  if (btn) {
+    btn.style.transition = 'none';
+    btn.style.backgroundSize = '0% 100%';
+  }
 }
 
 /* Refresh pin values, wire names, directions and pull states on initial

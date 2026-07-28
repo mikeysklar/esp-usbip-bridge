@@ -19,6 +19,11 @@
 #define DEVICE_NVS_KEY_HOSTNAME "hostname"
 
 /**
+ * @brief NVS key for the DUT board ID
+ */
+#define DEVICE_NVS_KEY_BOARD_ID "board_id"
+
+/**
  * @brief NVS key prefix for per-device friendly names (key = "name_<busid>")
  *        The busid is stored as a hex-encoded suffix to avoid characters that
  *        NVS keys cannot contain (like '-').
@@ -48,6 +53,28 @@ esp_err_t device_naming_get_hostname(char *buf, size_t buf_size);
  * @return ESP_OK on success.
  */
 esp_err_t device_naming_set_hostname(const char *hostname);
+
+/**
+ * @brief Get the board ID for the device under test.
+ *
+ * Reads from NVS.  Returns an empty string if unset.
+ *
+ * @param[out] buf       Buffer to write the board ID into.
+ * @param[in]  buf_size  Size of the buffer (at least DEVICE_NAME_MAX_LEN).
+ * @return ESP_OK on success.
+ */
+esp_err_t device_naming_get_board_id(char *buf, size_t buf_size);
+
+/**
+ * @brief Set the board ID for the device under test.
+ *
+ * Stores in NVS and commits.  Passing an empty string clears it.
+ *
+ * @param[in] board_id  Board ID string (up to DEVICE_NAME_MAX_LEN - 1 chars).
+ *                       Empty string to clear.
+ * @return ESP_OK on success.
+ */
+esp_err_t device_naming_set_board_id(const char *board_id);
 
 /**
  * @brief Get the friendly name for a specific USB device (by busid).

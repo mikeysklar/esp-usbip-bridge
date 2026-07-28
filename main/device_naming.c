@@ -121,6 +121,62 @@ esp_err_t device_naming_set_hostname(const char *hostname)
     return err;
 }
 
+esp_err_t device_naming_get_board_id(char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size < 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_ro(&h);
+    if (err != ESP_OK) {
+        buf[0] = '\0';
+        return err;
+    }
+
+    size_t len = buf_size;
+    err = nvs_get_str(h, DEVICE_NVS_KEY_BOARD_ID, buf, &len);
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        /* Found a stored value */
+        return ESP_OK;
+    }
+
+    /* Not found — return empty string */
+    buf[0] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t device_naming_set_board_id(const char *board_id)
+{
+    if (board_id == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_rw(&h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (strlen(board_id) == 0) {
+        err = nvs_erase_key(h, DEVICE_NVS_KEY_BOARD_ID);
+    } else {
+        err = nvs_set_str(h, DEVICE_NVS_KEY_BOARD_ID, board_id);
+    }
+
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Board ID set to: \"%s\"", strlen(board_id) ? board_id : "(cleared)");
+    }
+    return err;
+}
+
 esp_err_t device_naming_get_device_name(const char *busid, char *buf, size_t buf_size)
 {
     if (busid == NULL || buf == NULL || buf_size < 1) {

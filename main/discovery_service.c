@@ -33,6 +33,7 @@ typedef struct {
 } discovery_snapshot_t;
 
 static discovery_snapshot_t s_last_snapshot;
+static char s_board_id[DEVICE_NAME_MAX_LEN];
 
 static bool snapshot_changed(const discovery_snapshot_t *a, const discovery_snapshot_t *b)
 {
@@ -77,6 +78,7 @@ static esp_err_t discovery_publish_txt_from_snapshot(const discovery_snapshot_t 
         {.key = "vid", .value = vid},
         {.key = "pid", .value = pid},
         {.key = "target", .value = CONFIG_IDF_TARGET},
+        {.key = "board_id", .value = s_board_id},
     };
 
     return mdns_service_txt_set(USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, txt, sizeof(txt) / sizeof(txt[0]));
@@ -157,6 +159,9 @@ esp_err_t discovery_service_start(void)
         return err;
     }
 
+    /* Load the DUT board ID from NVS (static, doesn't change with devices) */
+    device_naming_get_board_id(s_board_id, sizeof(s_board_id));
+
     discovery_snapshot_t initial = {
         .count = 0,
         .primary_vid = 0,
@@ -172,6 +177,7 @@ esp_err_t discovery_service_start(void)
         {.key = "vid", .value = "-"},
         {.key = "pid", .value = "-"},
         {.key = "target", .value = CONFIG_IDF_TARGET},
+        {.key = "board_id", .value = s_board_id},
     };
 
     err = mdns_service_add(NULL,

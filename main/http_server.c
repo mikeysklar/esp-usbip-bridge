@@ -144,7 +144,7 @@ static void stream_printf(stream_t *s, const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    char tmp[1536];
+    char tmp[2048];
     (void)vsnprintf(tmp, sizeof(tmp), fmt, args);
     va_end(args);
     size_t n = strlen(tmp);
@@ -749,20 +749,39 @@ static void stream_html_page(stream_t *s)
     char hostname_str[DEVICE_NAME_MAX_LEN];
     device_naming_get_hostname(hostname_str, sizeof(hostname_str));
 
+    char board_id_str[DEVICE_NAME_MAX_LEN];
+    device_naming_get_board_id(board_id_str, sizeof(board_id_str));
+
     stream_printf(s,
         "<h1>\U0001f50c USB/IP Bridge</h1>\n"
         "<p class=\"sub\">Board: %s &mdash; %d DUT pins &mdash; FW: %s</p>\n"
-        "<p class=\"sub\">Hostname: <span id=\"hostname\">%s</span>"
+        "<p class=\"sub\">Hostname: <span id=\"hostname\">%s</span>",
+        board_get_name(), s_dut_pin_count, HARNESS_FW_VERSION, hostname_str);
+    stream_write(s,
         " <input id=\"hn-input\" type=\"text\" style=\"display:none;background:#0f3460;color:#eee;border:1px solid #555;padding:2px 6px;border-radius:3px;font-size:0.75rem\">"
         " <button id=\"hn-edit\" onclick=\"he()\" style=\"font-size:0.7rem\">Edit</button>"
         " <button id=\"hn-save\" onclick=\"hs()\" style=\"display:none;font-size:0.7rem\">Save</button>"
         " <button id=\"hn-cancel\" onclick=\"hc()\" style=\"display:none;font-size:0.7rem\">Cancel</button>"
+        "</p>\n", -1);
+    stream_printf(s,
+        "<p class=\"sub\">DUT Board ID: <span id=\"board_id\">%s</span>",
+        board_id_str);
+    stream_write(s,
+        " <input id=\"bi-input\" type=\"text\" style=\"display:none;background:#0f3460;color:#eee;border:1px solid #555;padding:2px 6px;border-radius:3px;font-size:0.75rem\">"
+        " <button id=\"bi-edit\" onclick=\"be()\" style=\"font-size:0.7rem\">Edit</button>"
+        " <button id=\"bi-save\" onclick=\"bs()\" style=\"display:none;font-size:0.7rem\">Save</button>"
+        " <button id=\"bi-cancel\" onclick=\"bc()\" style=\"display:none;font-size:0.7rem\">Cancel</button>"
         "</p>\n"
         "<p class=\"sub\">"
         "<button onclick=\"cfgExport()\" style=\"font-size:0.7rem\">Export Config</button>"
-        " <button onclick=\"cfgImportBtn()\" style=\"font-size:0.7rem\">Import Config</button>"
-        " <input id=\"cfgFile\" type=\"file\" accept=\"application/json,.json\""
-        " style=\"display:none\" onchange=\"cfgImportFile(this)\">"
+        " <button id=\"cfgClearBtn\" onmousedown=\"cfgClearStart(event)\""
+        " onmouseup=\"cfgClearCancel()\" onmouseleave=\"cfgClearCancel()\""
+        " ontouchstart=\"cfgClearStart(event)\" ontouchend=\"cfgClearCancel()\""
+        " ontouchcancel=\"cfgClearCancel()\""
+        " style=\"font-size:0.7rem;background-image:linear-gradient(to right,#e94560,#e94560);"
+        "background-repeat:no-repeat;background-size:0% 100%;background-color:#0f3460\">"
+        "Clear Config</button>"
+        " <button onclick=\"cfgImport()\" style=\"font-size:0.7rem\">Import Config</button>"
         "</p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
@@ -772,8 +791,7 @@ static void stream_html_page(stream_t *s)
         "<h2>DUT Header Pins</h2>\n"
         "<table><thead><tr><th>Pin</th><th>GPIO</th><th>Value</th>"
         "<th>DUT Name</th><th>Dir</th><th>Action</th><th>Pull</th>"
-        "</tr></thead><tbody>\n",
-        board_get_name(), s_dut_pin_count, HARNESS_FW_VERSION, hostname_str);
+        "</tr></thead><tbody>\n", -1);
 
     /* Stream each pin row. */
     for (int i = 0; i < s_dut_pin_count; i++) {
@@ -1085,11 +1103,13 @@ static void handle_get_config(int fd)
 {
     char hostname[DEVICE_NAME_MAX_LEN];
     device_naming_get_hostname(hostname, sizeof(hostname));
+    char board_id[DEVICE_NAME_MAX_LEN];
+    device_naming_get_board_id(board_id, sizeof(board_id));
 
     stream_t s;
     stream_begin(&s, fd, "application/json; charset=utf-8");
-    stream_printf(&s, "{\"version\":%d,\"hostname\":\"%s\",\"board\":\"%s\",\"wires\":[",
-                  CONFIG_EXPORT_VERSION, hostname, board_get_name());
+    stream_printf(&s, "{\"version\":%d,\"hostname\":\"%s\",\"board_id\":\"%s\",\"board\":\"%s\",\"wires\":[",
+                  CONFIG_EXPORT_VERSION, hostname, board_id, board_get_name());
     bool first = true;
     for (int i = 0; i < s_dut_pin_count; i++) {
         char wire[HARNESS_DUT_MAX_LABEL_LEN + 1];
@@ -1130,6 +1150,20 @@ static void handle_post_config(int fd, const char *body, size_t body_len)
         memcpy(hostname, hn, hn_len);
         hostname[hn_len] = '\0';
         device_naming_set_hostname(hostname);
+    }
+
+    /* Optional board_id. */
+    size_t bi_len;
+    const char *bi = json_str_after(body, "\"board_id\"", &bi_len);
+    if (bi && bi_len < DEVICE_NAME_MAX_LEN) {
+        char board_id[DEVICE_NAME_MAX_LEN];
+        if (bi_len > 0) {
+            memcpy(board_id, bi, bi_len);
+            board_id[bi_len] = '\0';
+            device_naming_set_board_id(board_id);
+        } else {
+            device_naming_set_board_id("");
+        }
     }
 
     /* Replace strategy: clear every known pin's wire, then apply the ones
@@ -1311,6 +1345,48 @@ static void handle_connection(int fd)
         return;
     }
 
+    /* GET /api/board_id - return the current DUT board ID */
+    if (strcmp(url, "/api/board_id") == 0 && strcmp(req.method, "GET") == 0) {
+        char board_id[DEVICE_NAME_MAX_LEN];
+        device_naming_get_board_id(board_id, sizeof(board_id));
+        char resp[256];
+        int rlen = snprintf(resp, sizeof(resp),
+            "{\"board_id\":\"%s\"}", board_id);
+        send_json_ok(fd, resp, rlen);
+        free(body_buf); free(buf);
+        return;
+    }
+
+    /* POST /api/board_id - set the DUT board ID */
+    if (strcmp(url, "/api/board_id") == 0 && strcmp(req.method, "POST") == 0) {
+        char board_id[DEVICE_NAME_MAX_LEN] = {0};
+        const char *bk = strstr(body_buf, "\"board_id\"");
+        if (bk) {
+            const char *c = strchr(bk, ':');
+            if (c) {
+                const char *q1 = strchr(c, '"');
+                if (q1) {
+                    const char *q2 = strchr(q1 + 1, '"');
+                    if (q2 && (size_t)(q2 - q1 - 1) < sizeof(board_id)) {
+                        memcpy(board_id, q1 + 1, q2 - q1 - 1);
+                        board_id[q2 - q1 - 1] = '\0';
+                    }
+                }
+            }
+        }
+        esp_err_t err = device_naming_set_board_id(board_id);
+        if (err == ESP_OK) {
+            char resp[128];
+            int rlen = snprintf(resp, sizeof(resp),
+                "{\"status\":\"ok\",\"board_id\":\"%s\"}", board_id);
+            send_json_ok(fd, resp, rlen);
+        } else {
+            http_500(fd);
+        }
+        free(body_buf); free(buf);
+        return;
+    }
+
     /* GET /api/config - export hostname + DUT pin/wire mapping as JSON */
     if (strcmp(url, "/api/config") == 0 && strcmp(req.method, "GET") == 0) {
         handle_get_config(fd);
@@ -1321,6 +1397,24 @@ static void handle_connection(int fd)
     /* POST /api/config - import (replace) hostname + DUT pin/wire mapping */
     if (strcmp(url, "/api/config") == 0 && strcmp(req.method, "POST") == 0) {
         handle_post_config(fd, body_buf, body_read);
+        free(body_buf); free(buf);
+        return;
+    }
+
+    /* POST /api/config/clear - clear all wire names and reset hostname */
+    if (strcmp(url, "/api/config/clear") == 0 && strcmp(req.method, "POST") == 0) {
+        neopixel_show_white_10s();
+        /* Clear every known pin's wire name. */
+        for (int i = 0; i < s_dut_pin_count; i++)
+            harness_dut_set_wire(s_dut_pins[i].label, "");
+        /* Reset hostname to default (empty string = MAC-based fallback). */
+        device_naming_set_hostname("");
+        /* Clear the DUT board ID. */
+        device_naming_set_board_id("");
+        char resp[128];
+        int rlen = snprintf(resp, sizeof(resp),
+            "{\"status\":\"ok\",\"message\":\"Configuration cleared\"}");
+        send_json_ok(fd, resp, rlen);
         free(body_buf); free(buf);
         return;
     }
