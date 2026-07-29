@@ -51,12 +51,22 @@ typedef struct {
     } u;
 } usb_backend_event_t;
 
-/* Unified per-pipe request slot.  One slot per host pipe, shared across
-   all devices and endpoints.  The caller fills a free slot, sets
-   active = true, notifies the backend task, then waits on done_sem. */
+/* Unified per-pipe request slot.  One slot per host pipe, allocated
+   dynamically per URB from a shared pool.  The caller takes a counting
+   semaphore to reserve capacity, fills a free slot, sets active = true,
+   notifies the backend task, then waits on done_sem.  After completion
+   the slot is freed back to the pool.
+
+   Transfers are submitted non-blocking: the backend task submits all
+   active pipes to the DWC hardware concurrently, then polls for
+   completion or timeout. */
 typedef struct {
     bool assigned;                  /* true = reserved for a device+endpoint */
-    volatile bool active;           /* true = transfer pending */
+    volatile bool active;           /* true = caller queued a transfer */
+    volatile bool submitted;        /* true = transfer handed to DWC hw */
+    volatile bool completed;        /* true = DWC callback has fired */
+    volatile bool aborted;          /* true = we forced abort (timeout/cancel) */
+
     char busid[32];
     uint8_t endpoint_addr;          /* 0 for control, 0x8N for IN, 0x0N for OUT */
     usb_setup_packet_t setup;       /* only used when endpoint_addr == 0 */
@@ -68,24 +78,26 @@ typedef struct {
     int *status_out;
     volatile bool *cancel;
     SemaphoreHandle_t done_sem;     /* pre-allocated, not per-call */
-} usb_backend_pipe_req_t;
 
-typedef struct {
-    bool done;
-    volatile bool *cancel;
-} transfer_done_ctx_t;
+    /* In-flight transfer tracking (for non-blocking operation) */
+    usb_transfer_t *xfer;           /* allocated transfer, NULL when idle */
+    usb_device_handle_t dev_hdl;    /* cached device handle for abort */
+    TickType_t deadline;            /* when the software timeout expires */
+    bool is_control;                /* true = EP0 control transfer */
+    bool is_in;                     /* true = device-to-host */
+    size_t payload_len;             /* requested data length */
+} usb_backend_pipe_req_t;
 
 typedef struct {
     bool in_use;
     bool interfaces_claimed;
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
-    int ep0_pipe;                                   /* pipe slot for EP0, -1 = none */
-    int ep_pipes[USBIP_MAX_ENDPOINTS];              /* pipe slot per endpoint, -1 = none */
 } usb_backend_device_slot_t;
 
 typedef struct {
     SemaphoreHandle_t state_mutex;
+    SemaphoreHandle_t pipe_avail_sem;           /* counting sem: tracks free pipe slots */
     QueueHandle_t event_queue;
     TaskHandle_t task_hdl;
 
@@ -302,31 +314,16 @@ static int alloc_pipe_locked(void)
     return -1;
 }
 
-static void free_pipe_locked(int pipe)
-{
-    if (pipe >= 0 && pipe < USB_BACKEND_NUM_PIPES) {
-        s_state.pipes[pipe].assigned = false;
-        s_state.pipes[pipe].active = false;
-    }
-}
-
 static void clear_slot_locked(int slot)
 {
     if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES) {
         return;
     }
 
-    /* Free any assigned pipe slots. */
-    free_pipe_locked(s_state.devices[slot].ep0_pipe);
-    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
-        free_pipe_locked(s_state.devices[slot].ep_pipes[i]);
-    }
+    /* Pipe slots are allocated dynamically per URB and freed by the
+       caller — no per-device pipe state to clean up here. */
 
     memset(&s_state.devices[slot], 0, sizeof(s_state.devices[slot]));
-    s_state.devices[slot].ep0_pipe = -1;
-    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
-        s_state.devices[slot].ep_pipes[i] = -1;
-    }
 }
 
 static void release_interfaces_locked(int slot)
@@ -348,11 +345,7 @@ static void release_interfaces_locked(int slot)
         }
     }
 
-    /* Free endpoint pipe slots. */
-    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
-        free_pipe_locked(s_state.devices[slot].ep_pipes[i]);
-        s_state.devices[slot].ep_pipes[i] = -1;
-    }
+    /* Pipe slots are allocated dynamically per URB — nothing to free here. */
 
     s_state.devices[slot].interfaces_claimed = false;
 }
@@ -378,16 +371,8 @@ static esp_err_t ensure_interfaces_claimed_locked(int slot)
         }
     }
 
-    /* Assign a pipe slot for each endpoint. */
-    for (uint8_t i = 0; i < device->num_endpoints; i++) {
-        int pipe = alloc_pipe_locked();
-        if (pipe < 0) {
-            ESP_LOGE(TAG, "No free pipe slots for endpoint 0x%02x on %s",
-                     device->endpoints[i].address, device->busid);
-            return ESP_ERR_NO_MEM;
-        }
-        s_state.devices[slot].ep_pipes[i] = pipe;
-    }
+    /* Pipe slots are allocated dynamically per URB — no per-endpoint
+       reservation needed. */
 
     s_state.devices[slot].interfaces_claimed = true;
     return ESP_OK;
@@ -511,17 +496,8 @@ static void export_new_device(uint8_t address)
     s_state.devices[free_slot].device = device;
     s_state.devices[free_slot].interfaces_claimed = false;
 
-    /* Initialize pipe slot mappings. */
-    s_state.devices[free_slot].ep0_pipe = alloc_pipe_locked();
-    if (s_state.devices[free_slot].ep0_pipe < 0) {
-        ESP_LOGW(TAG, "No free pipe slot for EP0 on %s", device.busid);
-    }
-    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
-        s_state.devices[free_slot].ep_pipes[i] = -1;
-    }
-
-    /* Non-zero endpoint pipes are allocated lazily when interfaces are
-       claimed, to conserve HCD channels. */
+    /* Pipe slots are allocated dynamically per URB — no per-device
+       pre-allocation needed. */
 
     xSemaphoreGive(s_state.state_mutex);
 
@@ -561,10 +537,13 @@ static void process_backend_events(void)
     }
 }
 
-static void control_transfer_done_cb(usb_transfer_t *transfer)
+/* Completion callback for all transfer types.  The context pointer is
+   the pipe slot, so we just set the completed flag.  The backend task
+   polls this flag to detect completion. */
+static void pipe_transfer_done_cb(usb_transfer_t *transfer)
 {
-    transfer_done_ctx_t *ctx = (transfer_done_ctx_t *)transfer->context;
-    ctx->done = true;
+    usb_backend_pipe_req_t *pipe = (usb_backend_pipe_req_t *)transfer->context;
+    pipe->completed = true;
 }
 
 static int map_transfer_status_to_errno(usb_transfer_status_t status)
@@ -609,47 +588,57 @@ static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
     return mps;
 }
 
-static int process_pipe_request(usb_backend_pipe_req_t *req)
+/* Submit one transfer to the DWC hardware.  Returns 0 on success (transfer
+   is now in-flight; the callback will set pipe->completed).  Returns a
+   negative errno on immediate failure (bad device, no memory, etc.). */
+static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
 {
-    if (req->in_len_out != NULL) {
-        *req->in_len_out = 0;
+    if (pipe->in_len_out != NULL) {
+        *pipe->in_len_out = 0;
     }
 
-    const bool is_control = (req->endpoint_addr == 0);
-    const bool is_in = is_control
-        ? (req->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
-        : (req->endpoint_addr & 0x80) != 0;
+    pipe->is_control = (pipe->endpoint_addr == 0);
+    pipe->is_in = pipe->is_control
+        ? (pipe->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
+        : (pipe->endpoint_addr & 0x80) != 0;
 
-    usb_device_handle_t dev_hdl = NULL;
+    ESP_LOGW(TAG, "process_pipe START busid=%.32s ep=0x%02x dir=%s is_ctrl=%d",
+             pipe->busid, pipe->endpoint_addr,
+             pipe->is_in ? "IN" : "OUT", pipe->is_control);
+
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    const int dev_slot = find_slot_by_busid_locked(req->busid);
+    const int dev_slot = find_slot_by_busid_locked(pipe->busid);
     if (dev_slot >= 0) {
-        if (!is_control) {
+        if (!pipe->is_control) {
             esp_err_t claim_err = ensure_interfaces_claimed_locked(dev_slot);
             if (claim_err != ESP_OK) {
                 xSemaphoreGive(s_state.state_mutex);
                 return -EIO;
             }
         }
-        dev_hdl = s_state.devices[dev_slot].dev_hdl;
+        pipe->dev_hdl = s_state.devices[dev_slot].dev_hdl;
+    } else {
+        pipe->dev_hdl = NULL;
     }
 
-    const size_t payload_len = is_in ? req->in_capacity : req->out_len;
+    pipe->payload_len = pipe->is_in ? pipe->in_capacity : pipe->out_len;
 
     /* For IN bulk/interrupt, round up to MPS while we hold the mutex. */
-    size_t xfer_len = is_control ? (USB_SETUP_PACKET_SIZE + payload_len) : payload_len;
-    if (!is_control && is_in && payload_len > 0 && dev_slot >= 0) {
-        uint16_t mps = get_endpoint_mps_locked(dev_slot, req->endpoint_addr);
+    size_t xfer_len = pipe->is_control
+        ? (USB_SETUP_PACKET_SIZE + pipe->payload_len)
+        : pipe->payload_len;
+    if (!pipe->is_control && pipe->is_in && pipe->payload_len > 0 && dev_slot >= 0) {
+        uint16_t mps = get_endpoint_mps_locked(dev_slot, pipe->endpoint_addr);
         if (mps > 0 && (xfer_len % mps) != 0) {
             xfer_len = ((xfer_len + mps - 1) / mps) * mps;
         }
     }
     xSemaphoreGive(s_state.state_mutex);
 
-    if (dev_hdl == NULL) {
+    if (pipe->dev_hdl == NULL) {
         return -ENODEV;
     }
-    if (payload_len > CONFIG_USBIP_MAX_TRANSFER) {
+    if (pipe->payload_len > CONFIG_USBIP_MAX_TRANSFER) {
         return -EMSGSIZE;
     }
 
@@ -659,84 +648,97 @@ static int process_pipe_request(usb_backend_pipe_req_t *req)
         return -ENOMEM;
     }
 
-    if (is_control) {
-        memcpy(transfer->data_buffer, &req->setup, USB_SETUP_PACKET_SIZE);
-        if (!is_in && req->out_len > 0 && req->out_data != NULL) {
-            memcpy(transfer->data_buffer + USB_SETUP_PACKET_SIZE, req->out_data, req->out_len);
+    if (pipe->is_control) {
+        memcpy(transfer->data_buffer, &pipe->setup, USB_SETUP_PACKET_SIZE);
+        if (!pipe->is_in && pipe->out_len > 0 && pipe->out_data != NULL) {
+            memcpy(transfer->data_buffer + USB_SETUP_PACKET_SIZE,
+                   pipe->out_data, pipe->out_len);
         }
-    } else if (!is_in && req->out_len > 0 && req->out_data != NULL) {
-        memcpy(transfer->data_buffer, req->out_data, req->out_len);
+    } else if (!pipe->is_in && pipe->out_len > 0 && pipe->out_data != NULL) {
+        memcpy(transfer->data_buffer, pipe->out_data, pipe->out_len);
     }
 
-    transfer_done_ctx_t done_ctx = {
-        .done = false,
-        .cancel = req->cancel,
-    };
-
-    transfer->callback = control_transfer_done_cb;
-    transfer->context = &done_ctx;
-    transfer->device_handle = dev_hdl;
-    transfer->bEndpointAddress = req->endpoint_addr;
+    transfer->callback = pipe_transfer_done_cb;
+    transfer->context = pipe;
+    transfer->device_handle = pipe->dev_hdl;
+    transfer->bEndpointAddress = pipe->endpoint_addr;
     transfer->num_bytes = xfer_len;
     transfer->timeout_ms = 5000;
 
-    if (is_control) {
+    if (pipe->is_control) {
         err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
     } else {
         err = usb_host_transfer_submit(transfer);
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "submit failed: %s (ep=0x%02x)", esp_err_to_name(err), req->endpoint_addr);
+        ESP_LOGW(TAG, "submit failed: %s (ep=0x%02x)",
+                 esp_err_to_name(err), pipe->endpoint_addr);
         usb_host_transfer_free(transfer);
         return (err == ESP_ERR_INVALID_STATE) ? -ENODEV : -EIO;
     }
 
-    bool cancelled = false;
-    while (!done_ctx.done) {
-        if (!cancelled && req->cancel != NULL && *req->cancel) {
-            cancelled = true;
-        }
-        err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG, "client_handle_events error: %s, done=%d (ep=0x%02x)",
-                     esp_err_to_name(err), done_ctx.done, req->endpoint_addr);
-            break;
-        }
+    pipe->xfer = transfer;
+    pipe->submitted = true;
+    pipe->completed = false;
+    pipe->aborted = false;
+    pipe->deadline = xTaskGetTickCount() + pdMS_TO_TICKS(transfer->timeout_ms);
+    return 0;
+}
+
+/* Finish a transfer that has completed (callback fired) or was aborted.
+   Reads the hardware result, copies IN data, frees the transfer object,
+   and returns the errno to report to the caller. */
+static int complete_transfer(usb_backend_pipe_req_t *pipe)
+{
+    usb_transfer_t *transfer = pipe->xfer;
+    int status;
+
+    if (pipe->completed) {
+        status = map_transfer_status_to_errno(transfer->status);
+    } else {
+        /* Aborted without callback firing (should be rare). */
+        status = -ETIMEDOUT;
     }
 
-    if (cancelled) {
-        usb_host_transfer_free(transfer);
-        return -ECONNRESET;
-    }
-
-    int status = map_transfer_status_to_errno(transfer->status);
     if (status != 0) {
-        ESP_LOGW(TAG, "transfer failed: usb_status=%d errno=%d done=%d (ep=0x%02x)",
-                 transfer->status, status, done_ctx.done, req->endpoint_addr);
+        ESP_LOGW(TAG, "transfer failed: usb_status=%d errno=%d (ep=0x%02x)",
+                 transfer->status, status, pipe->endpoint_addr);
     }
-    if (status == 0 && is_in && req->in_data != NULL && req->in_capacity > 0) {
+
+    /* Copy IN data on success. */
+    if (status == 0 && pipe->is_in && pipe->in_data != NULL
+        && pipe->in_capacity > 0) {
         size_t bytes;
-        if (is_control) {
+        if (pipe->is_control) {
             bytes = (transfer->actual_num_bytes > USB_SETUP_PACKET_SIZE)
                         ? (transfer->actual_num_bytes - USB_SETUP_PACKET_SIZE)
                         : 0;
         } else {
             bytes = transfer->actual_num_bytes;
-            if (bytes > payload_len) {
-                bytes = payload_len;
+            if (bytes > pipe->payload_len) {
+                bytes = pipe->payload_len;
             }
         }
-        const size_t copy_len = (bytes > req->in_capacity) ? req->in_capacity : bytes;
-        const uint8_t *src = is_control
+        const size_t copy_len =
+            (bytes > pipe->in_capacity) ? pipe->in_capacity : bytes;
+        const uint8_t *src = pipe->is_control
             ? (transfer->data_buffer + USB_SETUP_PACKET_SIZE)
             : transfer->data_buffer;
-        memcpy(req->in_data, src, copy_len);
-        if (req->in_len_out != NULL) {
-            *req->in_len_out = copy_len;
+        memcpy(pipe->in_data, src, copy_len);
+        if (pipe->in_len_out != NULL) {
+            *pipe->in_len_out = copy_len;
         }
+    } else if (pipe->in_len_out != NULL) {
+        *pipe->in_len_out = 0;
     }
 
+    uint32_t actual_bytes = transfer->actual_num_bytes;
     usb_host_transfer_free(transfer);
+    pipe->xfer = NULL;
+
+    ESP_LOGW(TAG, "process_pipe DONE busid=%.32s ep=0x%02x status=%d actual_bytes=%u",
+             pipe->busid, pipe->endpoint_addr, status,
+             (unsigned int)actual_bytes);
     return status;
 }
 
@@ -781,10 +783,12 @@ static void usb_backend_task(void *arg)
     ESP_LOGI(TAG, "USB backend task running (%d pipe slots)", USB_BACKEND_NUM_PIPES);
 
     while (true) {
-        /* Wait for a notification from a caller or a short timeout so we
-           still pump USB events regularly. */
+        /* Wait for a notification from a caller, or wake every 10ms to
+           poll timeouts. */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
 
+        /* Pump USB events — this also delivers transfer completion
+           callbacks (pipe->completed = true). */
         err = usb_host_client_handle_events(s_state.client_hdl, 0);
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "usb_host_client_handle_events failed: %s", esp_err_to_name(err));
@@ -792,19 +796,83 @@ static void usb_backend_task(void *arg)
 
         process_backend_events();
 
-        /* Process all active pipe request slots. */
+        const TickType_t now = xTaskGetTickCount();
+
+        /* Phase 1: Submit any newly-active pipes to the DWC hardware.
+           These transfers now run concurrently in hardware. */
         for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
             usb_backend_pipe_req_t *pipe = &s_state.pipes[i];
-            if (!pipe->active) {
+            if (!pipe->active || pipe->submitted) {
                 continue;
             }
 
-            int status = process_pipe_request(pipe);
-            if (pipe->status_out != NULL) {
-                *pipe->status_out = status;
+            int ret = prepare_and_submit_transfer(pipe);
+            if (ret < 0) {
+                /* Immediate failure (bad device, no memory, etc.) —
+                   complete the request now. */
+                pipe->active = false;
+                if (pipe->status_out != NULL) {
+                    *pipe->status_out = ret;
+                }
+                xSemaphoreGive(pipe->done_sem);
             }
-            pipe->active = false;
-            xSemaphoreGive(pipe->done_sem);
+        }
+
+        /* Phase 2: Check all in-flight transfers for completion,
+           timeout, or cancellation. */
+        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
+            usb_backend_pipe_req_t *pipe = &s_state.pipes[i];
+            if (!pipe->submitted) {
+                continue;
+            }
+
+            /* Detect external cancel requests. */
+            if (!pipe->aborted && pipe->cancel != NULL && *pipe->cancel) {
+                pipe->aborted = true;
+                ESP_LOGW(TAG, "transfer cancelled (ep=0x%02x)", pipe->endpoint_addr);
+            }
+
+            /* Detect software timeout (DWC hardware doesn't). */
+            if (!pipe->aborted && now >= pipe->deadline) {
+                pipe->aborted = true;
+                ESP_LOGW(TAG, "transfer timed out (ep=0x%02x)", pipe->endpoint_addr);
+            }
+
+            /* If we need to abort a non-control transfer that hasn't
+               completed yet, halt+flush the endpoint to force the DWC
+               hardware to fire the completion callback. */
+            if (pipe->aborted && !pipe->completed && !pipe->is_control
+                && pipe->dev_hdl != NULL) {
+                usb_host_endpoint_halt(pipe->dev_hdl, pipe->endpoint_addr);
+                usb_host_endpoint_flush(pipe->dev_hdl, pipe->endpoint_addr);
+                /* Pump events so the flush/halt callback fires. */
+                for (int j = 0; j < 50 && !pipe->completed; j++) {
+                    usb_host_client_handle_events(s_state.client_hdl,
+                                                  pdMS_TO_TICKS(10));
+                }
+                usb_host_endpoint_clear(pipe->dev_hdl, pipe->endpoint_addr);
+            }
+
+            /* If the transfer has completed (callback fired) or we've
+               aborted it, finalise and signal the waiting caller. */
+            if (pipe->completed || pipe->aborted) {
+                int status = complete_transfer(pipe);
+
+                /* If we forced the abort, override the hardware status
+                   with the appropriate errno. */
+                if (pipe->aborted) {
+                    status = (pipe->cancel != NULL && *pipe->cancel)
+                                 ? -ECONNRESET
+                                 : -ETIMEDOUT;
+                }
+
+                pipe->active = false;
+                pipe->submitted = false;
+                if (pipe->status_out != NULL) {
+                    *pipe->status_out = status;
+                }
+                xSemaphoreGive(pipe->done_sem);
+            }
         }
     }
 }
@@ -832,12 +900,20 @@ esp_err_t usb_backend_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Pre-allocate a binary semaphore for each pipe slot. */
+    /* Counting semaphore to limit concurrent in-flight transfers to the
+       number of hardware host channels. */
+    s_state.pipe_avail_sem = xSemaphoreCreateCounting(USB_BACKEND_NUM_PIPES, 0);
+    if (s_state.pipe_avail_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Release all slots into the pool. */
     for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
         s_state.pipes[i].done_sem = xSemaphoreCreateBinary();
         if (s_state.pipes[i].done_sem == NULL) {
             return ESP_ERR_NO_MEM;
         }
+        xSemaphoreGive(s_state.pipe_avail_sem);
     }
 
     s_state.event_queue = xQueueCreate(USB_BACKEND_EVENT_QUEUE_LEN, sizeof(usb_backend_event_t));
@@ -929,8 +1005,10 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
     return found;
 }
 
-/* Look up the pre-assigned pipe slot for this device+endpoint,
-   fill it, wake the backend task, and wait. */
+/* Reserve a free pipe slot, fill it with the caller's parameters,
+   wake the backend task, and wait for completion.  Each URB gets its
+   own dynamically-allocated slot — concurrent URBs on the same
+   endpoint no longer collide. */
 static int submit_pipe_request(const char busid[32],
                                uint8_t endpoint_addr,
                                const usb_setup_packet_t *setup,
@@ -947,41 +1025,47 @@ static int submit_pipe_request(const char busid[32],
 
     *in_len = 0;
 
-    /* Look up the pre-assigned pipe slot.  For non-zero endpoints that
-       haven't had interfaces claimed yet, use the EP0 pipe — the backend
-       task will claim interfaces (and assign proper pipe slots) before
-       submitting the transfer. */
-    int pipe_idx = -1;
+    /* Wait for a free host channel from the shared pool. */
+    xSemaphoreTake(s_state.pipe_avail_sem, portMAX_DELAY);
+
+    /* Allocate a specific slot under the mutex. */
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+
     const int dev_slot = find_slot_by_busid_locked(busid);
-    if (dev_slot >= 0) {
-        if (endpoint_addr == 0) {
-            pipe_idx = s_state.devices[dev_slot].ep0_pipe;
-        } else {
-            const usbip_backend_device_t *device = &s_state.devices[dev_slot].device;
-            for (uint8_t i = 0; i < device->num_endpoints; i++) {
-                if (device->endpoints[i].address == endpoint_addr) {
-                    pipe_idx = s_state.devices[dev_slot].ep_pipes[i];
-                    break;
-                }
-            }
-            /* If interfaces aren't claimed yet, use the EP0 pipe slot
-               temporarily.  process_pipe_request will claim interfaces
-               before submitting the USB transfer. */
-            if (pipe_idx < 0) {
-                pipe_idx = s_state.devices[dev_slot].ep0_pipe;
+    if (dev_slot < 0) {
+        xSemaphoreGive(s_state.state_mutex);
+        xSemaphoreGive(s_state.pipe_avail_sem);
+        return -ENODEV;
+    }
+
+    /* Verify the endpoint exists (non-EP0 only). */
+    if (endpoint_addr != 0) {
+        const usbip_backend_device_t *device = &s_state.devices[dev_slot].device;
+        bool found = false;
+        for (uint8_t i = 0; i < device->num_endpoints; i++) {
+            if (device->endpoints[i].address == endpoint_addr) {
+                found = true;
+                break;
             }
         }
+        if (!found) {
+            xSemaphoreGive(s_state.state_mutex);
+            xSemaphoreGive(s_state.pipe_avail_sem);
+            ESP_LOGW(TAG, "Unknown endpoint 0x%02x on %s", endpoint_addr, busid);
+            return -ENODEV;
+        }
     }
+
+    const int pipe_idx = alloc_pipe_locked();
     xSemaphoreGive(s_state.state_mutex);
 
-    if (dev_slot < 0) {
-        return -ENODEV;
-    }
     if (pipe_idx < 0) {
-        ESP_LOGW(TAG, "No pipe slot for ep=0x%02x on %s", endpoint_addr, busid);
-        return -ENODEV;
+        /* Should never happen if the counting semaphore is correct. */
+        xSemaphoreGive(s_state.pipe_avail_sem);
+        ESP_LOGE(TAG, "No free pipe slot (semaphore accounting error)");
+        return -EBUSY;
     }
+
     usb_backend_pipe_req_t *pipe = &s_state.pipes[pipe_idx];
 
     int status = -EIO;
@@ -1003,9 +1087,15 @@ static int submit_pipe_request(const char busid[32],
     pipe->active = true;
     xTaskNotifyGive(s_state.task_hdl);
 
-    /* Wait for the backend task to process this slot.  The semaphore is
-       pre-allocated so it can never be freed out from under us. */
+    /* Wait for the backend task to process this slot. */
     xSemaphoreTake(pipe->done_sem, portMAX_DELAY);
+
+    /* Return the pipe slot to the shared pool.  Only clear assigned;
+       active/submitted are owned by the backend task. */
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    pipe->assigned = false;
+    xSemaphoreGive(s_state.state_mutex);
+    xSemaphoreGive(s_state.pipe_avail_sem);
 
     return status;
 }
