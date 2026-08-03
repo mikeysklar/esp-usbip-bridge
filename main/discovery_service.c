@@ -112,6 +112,10 @@ static void discovery_task(void *arg)
             current.primary_pid = devices[0].id_product;
         }
 
+        /* Always re-read the board ID so runtime changes (via HTTP API)
+           are picked up without needing a reboot. */
+        device_naming_get_board_id(s_board_id, sizeof(s_board_id));
+
         if (snapshot_changed(&current, &s_last_snapshot)) {
             esp_err_t err = discovery_publish_txt_from_snapshot(&current);
             if (err == ESP_OK) {
@@ -192,6 +196,9 @@ esp_err_t discovery_service_start(void)
 
     s_last_snapshot = initial;
 
+    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local",
+             USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
+
     if (xTaskCreate(discovery_task,
                     "usbip_discovery",
                     USBIP_DISCOVERY_TASK_STACK,
@@ -201,7 +208,38 @@ esp_err_t discovery_service_start(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local",
-             USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
+    return ESP_OK;
+}
+
+esp_err_t discovery_service_notify_config_changed(void)
+{
+    char hostname[DEVICE_NAME_MAX_LEN];
+    device_naming_get_hostname(hostname, sizeof(hostname));
+
+    esp_err_t err = mdns_hostname_set(hostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_hostname_set failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    char instance[DEVICE_NAME_MAX_LEN + 32];
+    snprintf(instance, sizeof(instance), "%s (%s)", hostname, CONFIG_IDF_TARGET);
+    err = mdns_instance_name_set(instance);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_instance_name_set failed: %s", esp_err_to_name(err));
+        /* Non-fatal; continue to update TXT records. */
+    }
+
+    /* Re-read board ID and force re-publish of TXT records. */
+    device_naming_get_board_id(s_board_id, sizeof(s_board_id));
+
+    err = discovery_publish_txt_from_snapshot(&s_last_snapshot);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_service_txt_set failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "mDNS identity refreshed: host=%s.local, board_id=\"%s\"",
+             hostname, s_board_id);
     return ESP_OK;
 }

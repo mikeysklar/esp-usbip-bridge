@@ -23,6 +23,7 @@
 
 #include "board_pins.h"
 #include "device_naming.h"
+#include "discovery_service.h"
 #include "usb_backend.h"
 #include "virtual_device.h"
 #include "harness_io_expander.h"
@@ -1166,6 +1167,9 @@ static void handle_post_config(int fd, const char *body, size_t body_len)
         }
     }
 
+    /* Notify mDNS after hostname/board_id changes above. */
+    discovery_service_notify_config_changed();
+
     /* Replace strategy: clear every known pin's wire, then apply the ones
        from the import.  Pins not listed in the file end up cleared, which
        makes import a true restore. */
@@ -1334,6 +1338,7 @@ static void handle_connection(int fd)
         }
         esp_err_t err = device_naming_set_hostname(hostname);
         if (err == ESP_OK) {
+            discovery_service_notify_config_changed();
             char resp[128];
             int rlen = snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"hostname\":\"%s\"}", hostname);
@@ -1376,6 +1381,7 @@ static void handle_connection(int fd)
         }
         esp_err_t err = device_naming_set_board_id(board_id);
         if (err == ESP_OK) {
+            discovery_service_notify_config_changed();
             char resp[128];
             int rlen = snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"board_id\":\"%s\"}", board_id);
@@ -1411,6 +1417,7 @@ static void handle_connection(int fd)
         device_naming_set_hostname("");
         /* Clear the DUT board ID. */
         device_naming_set_board_id("");
+        discovery_service_notify_config_changed();
         char resp[128];
         int rlen = snprintf(resp, sizeof(resp),
             "{\"status\":\"ok\",\"message\":\"Configuration cleared\"}");

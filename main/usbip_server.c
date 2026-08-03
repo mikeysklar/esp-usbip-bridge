@@ -1,10 +1,9 @@
 #include "usbip_server.h"
 
-#define LOG_LOCAL_LEVEL ESP_LOG_WARN
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,6 +25,9 @@
 #include "virtual_device.h"
 
 static const char *TAG = "usbip";
+
+/* Track active client connections for debugging FD exhaustion. */
+static atomic_int active_connections;
 
 static bool read_exact(int fd, void *buf, size_t len)
 {
@@ -200,264 +202,363 @@ static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t statu
     return write_all(fd, &reply, sizeof(reply));
 }
 
-static bool handle_submit(int fd,
-                          const usbip_header_t *request,
-                          const char imported_busid[32],
-                          uint32_t expected_devid,
-                          volatile bool *cancel)
+
+/* Maximum concurrent in-flight URBs per TCP connection. */
+#define URB_STREAM_MAX_INFLIGHT 8
+
+/* Per-connection context shared between the reader loop and worker tasks. */
+typedef struct {
+    int fd;
+    volatile bool cancel;                   /* set when client disconnects */
+    SemaphoreHandle_t write_mutex;          /* serialises socket writes */
+    atomic_int inflight_count;              /* active worker tasks */
+    struct {
+        volatile bool *cancel_ptr;          /* pointer to per-URB cancel flag */
+        uint32_t seqnum;
+    } in_flight[URB_STREAM_MAX_INFLIGHT];
+} urb_stream_ctx_t;
+
+/* Work item handed to a worker task.  The worker does the blocking
+   backend call, sends the response (under write_mutex), and frees
+   all associated memory. */
+typedef struct {
+    urb_stream_ctx_t *stream;
+    usbip_header_t request;
+    char imported_busid[32];
+    uint32_t expected_devid;
+    volatile bool cancel;
+    uint8_t *out_data;
+    size_t out_len;
+    uint8_t *in_data;
+    size_t in_capacity;
+    int slot;                               /* index in stream->in_flight[] */
+} urb_work_item_t;
+
+/* Free an in-flight slot so it can be reused. */
+static void urb_stream_free_slot(urb_stream_ctx_t *ctx, int slot)
 {
-    const uint32_t seqnum = ntohl(request->base.seqnum);
-    const uint32_t devid = ntohl(request->base.devid);
-    const uint32_t direction = ntohl(request->base.direction);
-    const uint32_t endpoint = ntohl(request->base.ep);
-    const uint32_t transfer_flags = ntohl(request->u.cmd_submit.transfer_flags);
-    const int32_t req_len = (int32_t)ntohl((uint32_t)request->u.cmd_submit.transfer_buffer_length);
-    const uint32_t packet_count = (uint32_t)ntohl((uint32_t)request->u.cmd_submit.number_of_packets);
+    ctx->in_flight[slot].cancel_ptr = NULL;
+    ctx->in_flight[slot].seqnum = 0;
+    atomic_fetch_sub(&ctx->inflight_count, 1);
+}
 
-    ESP_LOGI(TAG, "CMD_SUBMIT seq=%"PRIu32" devid=0x%08"PRIx32" ep=%"PRIu32" dir=%s len=%"PRId32" flags=0x%"PRIx32" pkts=0x%08"PRIx32,
-             seqnum, devid, endpoint,
-             direction == USBIP_DIR_IN ? "IN" : "OUT",
-             req_len, transfer_flags, packet_count);
-
-    if (endpoint == 0) {
-        const uint8_t *s = request->u.cmd_submit.setup;
-        ESP_LOGI(TAG, "  setup: bmReqType=0x%02x bReq=0x%02x wValue=0x%04x wIndex=0x%04x wLength=0x%04x",
-                 s[0], s[1], s[2] | (s[3] << 8), s[4] | (s[5] << 8), s[6] | (s[7] << 8));
-    }
-
-    if (req_len < 0) {
-        ESP_LOGW(TAG, "  -> EINVAL (req_len < 0)");
-        return send_ret_submit(fd, request, -EINVAL, NULL, 0);
-    }
-    if (req_len > CONFIG_USBIP_MAX_TRANSFER) {
-        ESP_LOGW(TAG, "  -> EMSGSIZE (req_len %"PRId32" > max %d)", req_len, CONFIG_USBIP_MAX_TRANSFER);
-        if (direction == USBIP_DIR_OUT && req_len > 0) {
-            if (!discard_exact(fd, (size_t)req_len)) {
-                return false;
-            }
-        }
-        return send_ret_submit(fd, request, -EMSGSIZE, NULL, 0);
-    }
-    if (direction != USBIP_DIR_OUT && direction != USBIP_DIR_IN) {
-        ESP_LOGW(TAG, "  -> bad direction %"PRIu32, direction);
-        return false;
-    }
-
-    if (devid != expected_devid) {
-        ESP_LOGW(TAG, "  -> ENODEV (devid 0x%08"PRIx32" != expected 0x%08"PRIx32")", devid, expected_devid);
-        if (direction == USBIP_DIR_OUT && req_len > 0) {
-            if (!discard_exact(fd, (size_t)req_len)) {
-                return false;
-            }
-        }
-        return send_ret_submit(fd, request, -ENODEV, NULL, 0);
-    }
-
-    uint8_t *out_buf = NULL;
-    if (direction == USBIP_DIR_OUT && req_len > 0) {
-        out_buf = malloc((size_t)req_len);
-        if (out_buf == NULL) {
-            if (!discard_exact(fd, (size_t)req_len)) {
-                return false;
-            }
-            return send_ret_submit(fd, request, -ENOMEM, NULL, 0);
-        }
-
-        if (!read_exact(fd, out_buf, (size_t)req_len)) {
-            free(out_buf);
-            return false;
+/* Allocate an in-flight slot, link the cancel pointer, return index. */
+static int urb_stream_alloc_slot(urb_stream_ctx_t *ctx, uint32_t seqnum,
+                                  volatile bool *cancel_ptr)
+{
+    for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
+        if (ctx->in_flight[i].cancel_ptr == NULL) {
+            ctx->in_flight[i].cancel_ptr = cancel_ptr;
+            ctx->in_flight[i].seqnum = seqnum;
+            atomic_fetch_add(&ctx->inflight_count, 1);
+            return i;
         }
     }
+    return -1;
+}
 
-    /* The kernel sends number_of_packets=0 for non-ISO transfers while
-       some clients send 0xFFFFFFFF (-1).  Reject only positive values,
-       which indicate actual isochronous packet counts (unsupported). */
-    if (packet_count != USBIP_NON_ISO_PACKETS && packet_count != 0) {
-        ESP_LOGW(TAG, "  -> EOPNOTSUPP (iso packet_count=%"PRIu32")", packet_count);
-        free(out_buf);
-        return send_ret_submit(fd, request, -EOPNOTSUPP, NULL, 0);
-    }
-
-    uint8_t *in_buf = NULL;
-    const size_t in_cap = (direction == USBIP_DIR_IN) ? (size_t)req_len : 0;
-    if (in_cap > 0) {
-        in_buf = malloc(in_cap);
-        if (in_buf == NULL) {
-            free(out_buf);
-            return send_ret_submit(fd, request, -ENOMEM, NULL, 0);
+/* Find an in-flight slot by seqnum (for CMD_UNLINK). */
+static int urb_stream_find_by_seqnum(urb_stream_ctx_t *ctx, uint32_t seqnum)
+{
+    for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
+        if (ctx->in_flight[i].cancel_ptr != NULL
+            && ctx->in_flight[i].seqnum == seqnum) {
+            return i;
         }
     }
+    return -1;
+}
 
+/* Worker task: does the blocking USB transfer, sends the response,
+   and frees everything. */
+static void urb_worker_task(void *arg)
+{
+    urb_work_item_t *item = (urb_work_item_t *)arg;
+    urb_stream_ctx_t *ctx = item->stream;
+    const uint32_t direction = ntohl(item->request.base.direction);
+    const uint32_t endpoint = ntohl(item->request.base.ep);
     size_t in_len = 0;
     int status;
 
     /* Check if this is a virtual device. */
-    virtual_device_t *vdev = virtual_device_find_by_busid(imported_busid);
+    virtual_device_t *vdev = virtual_device_find_by_busid(item->imported_busid);
 
     if (vdev != NULL) {
-        /* Virtual device — dispatch to its ops. */
         if (endpoint == 0) {
             usb_setup_packet_t setup;
-            memcpy(&setup, request->u.cmd_submit.setup, sizeof(setup));
+            memcpy(&setup, item->request.u.cmd_submit.setup, sizeof(setup));
             status = vdev->ops->control_transfer(vdev, &setup,
-                                                  out_buf,
-                                                  (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                                  in_buf, in_cap, &in_len);
-            ESP_LOGI(TAG, "  vdev ctrl -> status=%d in_len=%zu", status, in_len);
+                                                  item->out_data, item->out_len,
+                                                  item->in_data, item->in_capacity,
+                                                  &in_len);
         } else {
             const uint8_t ep_addr = (uint8_t)(endpoint |
-                                              (direction == USBIP_DIR_IN ? 0x80 : 0x00));
+                (direction == USBIP_DIR_IN ? 0x80 : 0x00));
             status = vdev->ops->data_transfer(vdev, ep_addr,
-                                               out_buf,
-                                               (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                               in_buf, in_cap, &in_len);
-            ESP_LOGI(TAG, "  vdev data ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
+                                               item->out_data, item->out_len,
+                                               item->in_data, item->in_capacity,
+                                               &in_len);
+
         }
     } else if (endpoint == 0) {
-        /* Control transfer on EP0. */
         usb_setup_packet_t setup;
-        memcpy(&setup, request->u.cmd_submit.setup, sizeof(setup));
-        const bool setup_in = (setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
-        if (((direction == USBIP_DIR_IN) ? true : false) != setup_in) {
-            free(out_buf);
-            free(in_buf);
-            return send_ret_submit(fd, request, -EINVAL, NULL, 0);
-        }
-
-        status = usb_backend_control_transfer(imported_busid,
+        memcpy(&setup, item->request.u.cmd_submit.setup, sizeof(setup));
+        status = usb_backend_control_transfer(item->imported_busid,
                                               &setup,
-                                              out_buf,
-                                              (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                              in_buf,
-                                              in_cap,
+                                              item->out_data, item->out_len,
+                                              item->in_data, item->in_capacity,
                                               &in_len,
-                                              cancel);
-        ESP_LOGI(TAG, "  ctrl_transfer -> status=%d in_len=%zu", status, in_len);
+                                              &item->cancel);
     } else {
-        /* Bulk or interrupt transfer on a non-zero endpoint. */
         const uint8_t ep_addr = (uint8_t)(endpoint |
-                                          (direction == USBIP_DIR_IN ? 0x80 : 0x00));
-
-        if (usb_backend_is_interrupt_endpoint(imported_busid, endpoint, direction == USBIP_DIR_IN)) {
-            status = usb_backend_interrupt_transfer(imported_busid,
+            (direction == USBIP_DIR_IN ? 0x80 : 0x00));
+        if (usb_backend_is_interrupt_endpoint(item->imported_busid, endpoint,
+                                              direction == USBIP_DIR_IN)) {
+            status = usb_backend_interrupt_transfer(item->imported_busid,
                                                     ep_addr,
-                                                    out_buf,
-                                                    (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                                    in_buf,
-                                                    in_cap,
+                                                    item->out_data, item->out_len,
+                                                    item->in_data, item->in_capacity,
                                                     &in_len,
-                                                    cancel);
-            ESP_LOGI(TAG, "  intr_transfer ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
+                                                    &item->cancel);
+
         } else {
-            status = usb_backend_bulk_transfer(imported_busid,
+            status = usb_backend_bulk_transfer(item->imported_busid,
                                                ep_addr,
-                                               out_buf,
-                                               (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                               in_buf,
-                                               in_cap,
+                                               item->out_data, item->out_len,
+                                               item->in_data, item->in_capacity,
                                                &in_len,
-                                               cancel);
-            ESP_LOGI(TAG, "  bulk_transfer ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
+                                               &item->cancel);
+
         }
     }
 
-    const bool ok = send_ret_submit(fd,
-                                    request,
-                                    status,
-                                    (status == 0 && direction == USBIP_DIR_IN) ? in_buf : NULL,
-                                    (status == 0 && direction == USBIP_DIR_IN) ? (uint32_t)in_len : 0);
+    /* Serialise writes to the shared TCP socket. */
+    xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
+    send_ret_submit(ctx->fd, &item->request, status,
+                    (status == 0 && direction == USBIP_DIR_IN) ? item->in_data : NULL,
+                    (status == 0 && direction == USBIP_DIR_IN) ? (uint32_t)in_len : 0);
+    xSemaphoreGive(ctx->write_mutex);
 
-    free(out_buf);
-    free(in_buf);
-
-    return ok;
-}
-
-typedef struct {
-    int fd;
-    volatile bool cancel;
-} urb_stream_ctx_t;
-
-static void socket_watchdog_task(void *arg)
-{
-    urb_stream_ctx_t *ctx = (urb_stream_ctx_t *)arg;
-    uint8_t probe;
-
-    /* Poll the socket for disconnect while a transfer is in progress.
-       When recv returns 0 or error, the client is gone. */
-    while (!ctx->cancel) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(ctx->fd, &readfds);
-
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50ms */
-        int ret = select(ctx->fd + 1, &readfds, NULL, NULL, &tv);
-        if (ret > 0) {
-            /* Socket is readable — either data arrived or it's closed. */
-            ret = recv(ctx->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (ret <= 0) {
-                ctx->cancel = true;
-                break;
-            }
-            /* Data available means the main loop will read it. */
-            break;
-        }
-    }
-
+    /* Release the slot and free everything. */
+    urb_stream_free_slot(ctx, item->slot);
+    free(item->out_data);
+    free(item->in_data);
+    free(item);
     vTaskDelete(NULL);
 }
 
-static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t expected_devid)
+static bool handle_urb_stream(int fd, const char imported_busid[32],
+                               uint32_t expected_devid)
 {
-    urb_stream_ctx_t ctx = {
-        .fd = fd,
-        .cancel = false,
-    };
+    /* Heap-allocate the stream context so worker tasks can safely
+       access it even after this function starts unwinding.  The last
+       worker to call urb_stream_free_slot() is responsible for
+       freeing the context when the stream is shutting down. */
+    urb_stream_ctx_t *ctx = calloc(1, sizeof(urb_stream_ctx_t));
+    if (ctx == NULL) {
+        return false;
+    }
+    ctx->fd = fd;
+    ctx->write_mutex = xSemaphoreCreateMutex();
+    if (ctx->write_mutex == NULL) {
+        free(ctx);
+        return false;
+    }
 
-    const bool is_virtual = (virtual_device_find_by_busid(imported_busid) != NULL);
+    const bool is_virtual =
+        (virtual_device_find_by_busid(imported_busid) != NULL);
 
     while (true) {
         usbip_header_t request;
         if (!read_exact(fd, &request, sizeof(request))) {
-            ESP_LOGI(TAG, "URB stream: read failed (client disconnected?)");
-            return false;
+            ESP_LOGD(TAG, "URB stream: read failed (client disconnected?)");
+            goto cleanup;
         }
-
-        ctx.cancel = false;
 
         const uint32_t command = ntohl(request.base.command);
-        if (command == USBIP_CMD_SUBMIT) {
-            /* For real USB devices, start a watchdog that sets cancel if
-               the client disconnects while blocked in a USB transfer.
-               Virtual devices complete instantly and don't need this. */
-            TaskHandle_t watchdog = NULL;
-            if (!is_virtual) {
-                xTaskCreate(socket_watchdog_task, "sock_wd", 3072, &ctx,
-                            CONFIG_USBIP_SERVER_TASK_PRIORITY, &watchdog);
-            }
 
-            bool ok = handle_submit(fd, &request, imported_busid, expected_devid, &ctx.cancel);
-
-            if (watchdog != NULL) {
-                /* Signal the watchdog to stop and give it time to exit. */
-                ctx.cancel = true;
-                vTaskDelay(pdMS_TO_TICKS(10));
+        if (command == USBIP_CMD_UNLINK) {
+            const uint32_t unlink_seq = ntohl(request.u.cmd_unlink.unlink_seqnum);
+            ESP_LOGD(TAG, "CMD_UNLINK seq=%"PRIu32, unlink_seq);
+            /* Cancel the matching in-flight URB. */
+            int slot = urb_stream_find_by_seqnum(ctx, unlink_seq);
+            if (slot >= 0 && ctx->in_flight[slot].cancel_ptr != NULL) {
+                *ctx->in_flight[slot].cancel_ptr = true;
             }
-
-            if (!ok) {
-                ESP_LOGW(TAG, "URB stream: handle_submit failed");
-                return false;
-            }
-        } else if (command == USBIP_CMD_UNLINK) {
-            ESP_LOGI(TAG, "CMD_UNLINK seq=%"PRIu32, ntohl(request.base.seqnum));
             if (!send_ret_unlink(fd, &request, 0)) {
-                return false;
+                goto cleanup;
             }
+            continue;
+        }
+
+        if (command != USBIP_CMD_SUBMIT) {
+            ESP_LOGD(TAG, "Unsupported USB/IP command: 0x%08"PRIx32, command);
+            goto cleanup;
+        }
+
+        /* --- CMD_SUBMIT: validate and read out-data in the reader
+               loop (preserves TCP ordering), then hand off to a
+               worker task for the blocking backend call. --- */
+
+        const uint32_t seqnum = ntohl(request.base.seqnum);
+        const uint32_t devid = ntohl(request.base.devid);
+        const uint32_t direction = ntohl(request.base.direction);
+        const uint32_t endpoint = ntohl(request.base.ep);
+        const int32_t req_len =
+            (int32_t)ntohl((uint32_t)request.u.cmd_submit.transfer_buffer_length);
+        const uint32_t packet_count =
+            (uint32_t)ntohl((uint32_t)request.u.cmd_submit.number_of_packets);
+
+        /* Quick validation — errors that don't need a worker. */
+        if (req_len < 0) {
+            ESP_LOGD(TAG, "  -> EINVAL (req_len < 0)");
+            if (!send_ret_submit(fd, &request, -EINVAL, NULL, 0))
+                goto cleanup;
+            continue;
+        }
+        if (req_len > CONFIG_USBIP_MAX_TRANSFER) {
+            ESP_LOGD(TAG, "  -> EMSGSIZE");
+            if (direction == USBIP_DIR_OUT && req_len > 0) {
+                if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
+            }
+            if (!send_ret_submit(fd, &request, -EMSGSIZE, NULL, 0))
+                goto cleanup;
+            continue;
+        }
+        if (direction != USBIP_DIR_OUT && direction != USBIP_DIR_IN) {
+            ESP_LOGD(TAG, "  -> bad direction");
+            goto cleanup;
+        }
+        if (devid != expected_devid) {
+            ESP_LOGD(TAG, "  -> ENODEV");
+            if (direction == USBIP_DIR_OUT && req_len > 0) {
+                if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
+            }
+            if (!send_ret_submit(fd, &request, -ENODEV, NULL, 0))
+                goto cleanup;
+            continue;
+        }
+        if (packet_count != USBIP_NON_ISO_PACKETS && packet_count != 0) {
+            ESP_LOGD(TAG, "  -> EOPNOTSUPP (iso)");
+            if (!send_ret_submit(fd, &request, -EOPNOTSUPP, NULL, 0))
+                goto cleanup;
+            continue;
+        }
+
+        /* For EP0 control transfers, check direction consistency. */
+        if (endpoint == 0) {
+            const bool setup_in =
+                (request.u.cmd_submit.setup[0] & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
+            if (((direction == USBIP_DIR_IN) ? true : false) != setup_in) {
+                if (!send_ret_submit(fd, &request, -EINVAL, NULL, 0))
+                    goto cleanup;
+                continue;
+            }
+        }
+
+        /* Read OUT data payload (follows the header in the TCP stream). */
+        uint8_t *out_data = NULL;
+        size_t out_len = (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0;
+        if (out_len > 0) {
+            out_data = malloc(out_len);
+            if (out_data == NULL) {
+                if (!discard_exact(fd, out_len)) goto cleanup;
+                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                    goto cleanup;
+                continue;
+            }
+            if (!read_exact(fd, out_data, out_len)) {
+                free(out_data);
+                goto cleanup;
+            }
+        }
+
+        /* Allocate IN buffer. */
+        uint8_t *in_data = NULL;
+        size_t in_capacity =
+            (direction == USBIP_DIR_IN) ? (size_t)req_len : 0;
+        if (in_capacity > 0) {
+            in_data = malloc(in_capacity);
+            if (in_data == NULL) {
+                free(out_data);
+                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                    goto cleanup;
+                continue;
+            }
+        }
+
+        /* Build work item and spawn worker. */
+        urb_work_item_t *item = calloc(1, sizeof(urb_work_item_t));
+        if (item == NULL) {
+            free(out_data);
+            free(in_data);
+            if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                goto cleanup;
+            continue;
+        }
+
+        item->stream = ctx;
+        item->request = request;
+        memcpy(item->imported_busid, imported_busid, sizeof(item->imported_busid));
+        item->expected_devid = expected_devid;
+        item->cancel = false;
+        item->out_data = out_data;
+        item->out_len = out_len;
+        item->in_data = in_data;
+        item->in_capacity = in_capacity;
+
+        item->slot = urb_stream_alloc_slot(ctx, seqnum, &item->cancel);
+        if (item->slot < 0) {
+            /* Too many in-flight URBs — wait for a slot, then retry.
+               This is simpler than implementing a wait queue. */
+            ESP_LOGD(TAG, "  -> too many in-flight, waiting");
+            while (item->slot < 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                item->slot = urb_stream_alloc_slot(ctx, seqnum,
+                                                    &item->cancel);
+                if (ctx->cancel) {
+                    free(out_data);
+                    free(in_data);
+                    free(item);
+                    goto cleanup;
+                }
+            }
+        }
+
+        /* Virtual devices complete instantly, so we can run them
+           inline and avoid the task creation overhead. */
+        if (is_virtual) {
+            urb_worker_task(item);
         } else {
-            ESP_LOGW(TAG, "Unsupported USB/IP command: 0x%08" PRIx32, command);
-            return false;
+            if (xTaskCreate(urb_worker_task, "urb_wrk",
+                            CONFIG_USBIP_SERVER_TASK_STACK, item,
+                            CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
+                urb_stream_free_slot(ctx, item->slot);
+                free(out_data);
+                free(in_data);
+                free(item);
+                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                    goto cleanup;
+            }
         }
     }
+
+cleanup:
+    /* Signal all in-flight workers to abort, then wait for them. */
+    ctx->cancel = true;
+    for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
+        if (ctx->in_flight[i].cancel_ptr != NULL) {
+            *ctx->in_flight[i].cancel_ptr = true;
+        }
+    }
+    /* Give workers time to wake up and exit. */
+    for (int timeout = 0; timeout < 50; timeout++) {
+        if (atomic_load(&ctx->inflight_count) == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vSemaphoreDelete(ctx->write_mutex);
+    free(ctx);
+    return false;
 }
 
 static bool handle_devlist_request(int fd)
@@ -470,9 +571,9 @@ static bool handle_devlist_request(int fd)
 
     const size_t device_count = usb_backend_get_devices(devices, CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX);
 
-    ESP_LOGI(TAG, "DEVLIST: reporting %zu devices", device_count);
+    ESP_LOGD(TAG, "DEVLIST: reporting %zu devices", device_count);
     for (size_t i = 0; i < device_count; i++) {
-        ESP_LOGI(TAG, "  [%zu] busid=%.32s vid=%04x pid=%04x class=%02x speed=%"PRIu32" intfs=%u",
+        ESP_LOGD(TAG, "  [%zu] busid=%.32s vid=%04x pid=%04x class=%02x speed=%"PRIu32" intfs=%u",
                  i, devices[i].busid, devices[i].id_vendor, devices[i].id_product,
                  devices[i].device_class, devices[i].speed, devices[i].num_interfaces);
     }
@@ -503,24 +604,24 @@ static bool handle_import_request(int fd)
 {
     char requested_busid[32];
     if (!read_exact(fd, requested_busid, sizeof(requested_busid))) {
-        ESP_LOGW(TAG, "IMPORT: failed to read busid");
+        ESP_LOGD(TAG, "IMPORT: failed to read busid");
         return false;
     }
 
-    ESP_LOGI(TAG, "IMPORT: requested busid='%.32s'", requested_busid);
+    ESP_LOGD(TAG, "IMPORT: requested busid='%.32s'", requested_busid);
 
     usbip_backend_device_t device;
     const bool found = usb_backend_get_device_by_busid(requested_busid, &device);
 
-    ESP_LOGI(TAG, "IMPORT: device lookup %s (busid='%.32s')", found ? "FOUND" : "NOT FOUND", requested_busid);
+    ESP_LOGD(TAG, "IMPORT: device lookup %s (busid='%.32s')", found ? "FOUND" : "NOT FOUND", requested_busid);
 
     if (!send_op_common(fd, USBIP_OP_REP_IMPORT, found ? 0 : 1)) {
-        ESP_LOGW(TAG, "IMPORT: failed to send reply header");
+        ESP_LOGD(TAG, "IMPORT: failed to send reply header");
         return false;
     }
 
     if (!found) {
-        ESP_LOGW(TAG, "IMPORT: device not found, closing");
+        ESP_LOGD(TAG, "IMPORT: device not found, closing");
         return true;
     }
 
@@ -536,7 +637,7 @@ static bool handle_import_request(int fd)
         return false;
     }
 
-    ESP_LOGI(TAG, "Client imported %s", device.busid);
+    ESP_LOGD(TAG, "Client imported %s", device.busid);
     return handle_urb_stream(fd, requested_busid, make_devid(&device));
 }
 
@@ -544,34 +645,34 @@ static void handle_client(int fd)
 {
     usbip_op_common_t request;
     if (!read_exact(fd, &request, sizeof(request))) {
-        ESP_LOGW(TAG, "Failed to read op_common header (%d bytes)", (int)sizeof(request));
+        ESP_LOGD(TAG, "Failed to read op_common header (%d bytes)", (int)sizeof(request));
         return;
     }
 
     const uint16_t version = ntohs(request.version);
     const uint16_t code = ntohs(request.code);
 
-    ESP_LOGI(TAG, "Received op: version=0x%04x code=0x%04x status=0x%08"PRIx32,
+    ESP_LOGD(TAG, "Received op: version=0x%04x code=0x%04x status=0x%08"PRIx32,
              version, code, (uint32_t)ntohl(request.status));
 
     if (version != USBIP_VERSION) {
-        ESP_LOGW(TAG, "Unsupported USB/IP version 0x%04x (expected 0x%04x)", version, USBIP_VERSION);
+        ESP_LOGD(TAG, "Unsupported USB/IP version 0x%04x (expected 0x%04x)", version, USBIP_VERSION);
         return;
     }
 
     if (code == USBIP_OP_REQ_DEVLIST) {
-        ESP_LOGI(TAG, "Handling DEVLIST request");
+        ESP_LOGD(TAG, "Handling DEVLIST request");
         (void)handle_devlist_request(fd);
         return;
     }
 
     if (code == USBIP_OP_REQ_IMPORT) {
-        ESP_LOGI(TAG, "Handling IMPORT request");
+        ESP_LOGD(TAG, "Handling IMPORT request");
         (void)handle_import_request(fd);
         return;
     }
 
-    ESP_LOGW(TAG, "Unsupported USB/IP op request 0x%04x", code);
+    ESP_LOGD(TAG, "Unsupported USB/IP op request 0x%04x", code);
 }
 
 typedef struct {
@@ -586,7 +687,10 @@ static void client_task(void *arg)
 
     handle_client(fd);
     close(fd);
-    ESP_LOGI(TAG, "Client disconnected");
+
+    const int remaining = atomic_fetch_sub(&active_connections, 1) - 1;
+    ESP_LOGD(TAG, "Client disconnected (%d active connection%s)",
+             remaining, remaining == 1 ? "" : "s");
 
     vTaskDelete(NULL);
 }
@@ -625,26 +729,46 @@ static void usbip_server_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "USB/IP server listening on TCP %d", USBIP_TCP_PORT);
+    ESP_LOGD(TAG, "USB/IP server listening on TCP %d", USBIP_TCP_PORT);
 
     while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         const int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            ESP_LOGW(TAG, "accept() failed: errno=%d", errno);
+            const int current = atomic_load(&active_connections);
+            const char *errname = "UNKNOWN";
+            switch (errno) {
+                case 23: errname = "ENFILE (too many open files)"; break;
+                case 24: errname = "EMFILE (too many open fds)"; break;
+                case 11: errname = "EAGAIN"; break;
+                case 22: errname = "EINVAL"; break;
+                case  9: errname = "EBADF"; break;
+                case 12: errname = "ENOMEM"; break;
+                case 14: errname = "EFAULT"; break;
+            }
+            ESP_LOGD(TAG, "accept() failed: errno=%d (%s) — %d active connection%s",
+                     errno, errname, current, current == 1 ? "" : "s");
             continue;
         }
 
         int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        ESP_LOGI(TAG, "Client connected");
+        const int count = atomic_fetch_add(&active_connections, 1) + 1;
+        ESP_LOGD(TAG, "Client connected (%d active connection%s)",
+                 count, count == 1 ? "" : "s");
+        if (count >= 8) {
+            ESP_LOGD(TAG, "⚠ %d active connections — approaching FD limits!", count);
+        }
 
         client_task_ctx_t *ctx = malloc(sizeof(client_task_ctx_t));
         if (ctx == NULL) {
-            ESP_LOGW(TAG, "Failed to allocate client context");
+            ESP_LOGD(TAG, "Failed to allocate client context");
             close(client_fd);
+            const int remaining = atomic_fetch_sub(&active_connections, 1) - 1;
+            ESP_LOGD(TAG, "Connection dropped (%d active connection%s)",
+                     remaining, remaining == 1 ? "" : "s");
             continue;
         }
         ctx->fd = client_fd;
@@ -652,9 +776,12 @@ static void usbip_server_task(void *arg)
         if (xTaskCreate(client_task, "usbip_client",
                         CONFIG_USBIP_SERVER_TASK_STACK, ctx,
                         CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
-            ESP_LOGW(TAG, "Failed to create client task");
+            ESP_LOGD(TAG, "Failed to create client task");
             free(ctx);
             close(client_fd);
+            const int remaining = atomic_fetch_sub(&active_connections, 1) - 1;
+            ESP_LOGD(TAG, "Connection dropped (%d active connection%s)",
+                     remaining, remaining == 1 ? "" : "s");
         }
     }
 }

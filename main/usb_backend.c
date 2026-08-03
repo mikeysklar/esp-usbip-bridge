@@ -135,7 +135,7 @@ static esp_err_t usb_backend_s3_usb_otg_devkit_power_init(void)
     gpio_set_level(CONFIG_USBIP_S3_USB_LIMIT_EN_GPIO, 1);
     gpio_set_level(CONFIG_USBIP_S3_USB_SEL_GPIO, 1);
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "Configured ESP32-S3-USB-OTG host power GPIOs (%d,%d,%d,%d)",
              CONFIG_USBIP_S3_USB_BOOST_EN_GPIO,
              CONFIG_USBIP_S3_USB_DEV_VBUS_EN_GPIO,
@@ -171,7 +171,7 @@ static esp_err_t usb_backend_p4hil_usb_power_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "P4HIL USB host power enabled on Exp%d[%d]",
              exp_idx, pin);
     return ESP_OK;
@@ -341,7 +341,7 @@ static void release_interfaces_locked(int slot)
     for (uint8_t i = 0; i < device->num_interfaces; i++) {
         esp_err_t err = usb_host_interface_release(s_state.client_hdl, dev_hdl, i);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "usb_host_interface_release(%u) failed: %s", i, esp_err_to_name(err));
+            ESP_LOGD(TAG, "usb_host_interface_release(%u) failed: %s", i, esp_err_to_name(err));
         }
     }
 
@@ -362,11 +362,11 @@ static esp_err_t ensure_interfaces_claimed_locked(int slot)
     usb_device_handle_t dev_hdl = s_state.devices[slot].dev_hdl;
     const usbip_backend_device_t *device = &s_state.devices[slot].device;
 
-    ESP_LOGI(TAG, "Claiming %u interfaces for %s (lazy)", device->num_interfaces, device->busid);
+    ESP_LOGD(TAG, "Claiming %u interfaces for %s (lazy)", device->num_interfaces, device->busid);
     for (uint8_t i = 0; i < device->num_interfaces; i++) {
         esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, i, 0);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(err));
+            ESP_LOGD(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(err));
             return err;
         }
     }
@@ -390,7 +390,7 @@ static void close_slot_locked(int slot)
     if (dev_hdl != NULL) {
         esp_err_t err = usb_host_device_close(s_state.client_hdl, dev_hdl);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "usb_host_device_close failed: %s", esp_err_to_name(err));
+            ESP_LOGD(TAG, "usb_host_device_close failed: %s", esp_err_to_name(err));
         }
     }
 
@@ -403,7 +403,7 @@ static void usb_client_event_cb(const usb_host_client_event_msg_t *event_msg, vo
 
     usb_backend_event_t evt;
     if (event_msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-        ESP_LOGI(TAG, "USB device attached at address %u", event_msg->new_dev.address);
+        ESP_LOGW(TAG, "USB device attached at address %u", event_msg->new_dev.address);
         evt.type = USB_BACKEND_EVENT_NEW_DEV;
         evt.u.address = event_msg->new_dev.address;
     } else if (event_msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
@@ -415,7 +415,7 @@ static void usb_client_event_cb(const usb_host_client_event_msg_t *event_msg, vo
     }
 
     if (xQueueSend(state->event_queue, &evt, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Dropping USB event type=%d due to full queue", (int)evt.type);
+        ESP_LOGD(TAG, "Dropping USB event type=%d due to full queue", (int)evt.type);
     }
 }
 
@@ -424,14 +424,14 @@ static void export_new_device(uint8_t address)
     usb_device_handle_t dev_hdl = NULL;
     esp_err_t err = usb_host_device_open(s_state.client_hdl, address, &dev_hdl);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "usb_host_device_open(%u) failed: %s", address, esp_err_to_name(err));
+        ESP_LOGD(TAG, "usb_host_device_open(%u) failed: %s", address, esp_err_to_name(err));
         return;
     }
 
     const usb_device_desc_t *dev_desc = NULL;
     err = usb_host_get_device_descriptor(dev_hdl, &dev_desc);
     if (err != ESP_OK || dev_desc == NULL) {
-        ESP_LOGW(TAG, "usb_host_get_device_descriptor failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "usb_host_get_device_descriptor failed: %s", esp_err_to_name(err));
         usb_host_device_close(s_state.client_hdl, dev_hdl);
         return;
     }
@@ -439,7 +439,7 @@ static void export_new_device(uint8_t address)
     usb_device_info_t dev_info;
     err = usb_host_device_info(dev_hdl, &dev_info);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "usb_host_device_info failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "usb_host_device_info failed: %s", esp_err_to_name(err));
         usb_host_device_close(s_state.client_hdl, dev_hdl);
         return;
     }
@@ -468,7 +468,7 @@ static void export_new_device(uint8_t address)
     }
 
     if (is_hub_device(dev_desc, &device)) {
-        ESP_LOGI(TAG, "Hub detected at address=%u, managing locally (not exported)", address);
+        ESP_LOGW(TAG, "Hub detected at address=%u, managing locally (not exported)", address);
         usb_host_device_close(s_state.client_hdl, dev_hdl);
         return;
     }
@@ -486,7 +486,7 @@ static void export_new_device(uint8_t address)
     const int free_slot = find_free_slot_locked();
     if (free_slot < 0) {
         xSemaphoreGive(s_state.state_mutex);
-        ESP_LOGW(TAG, "No free export slots left (max=%d)", CONFIG_USBIP_MAX_DEVICES);
+        ESP_LOGD(TAG, "No free export slots left (max=%d)", CONFIG_USBIP_MAX_DEVICES);
         usb_host_device_close(s_state.client_hdl, dev_hdl);
         return;
     }
@@ -501,7 +501,7 @@ static void export_new_device(uint8_t address)
 
     xSemaphoreGive(s_state.state_mutex);
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "Exporting USB device busid=%s vid=%04x pid=%04x",
              device.busid,
              device.id_vendor,
@@ -518,7 +518,7 @@ static void remove_gone_device(usb_device_handle_t dev_hdl)
         strlcpy(busid, s_state.devices[slot].device.busid, sizeof(busid));
         close_slot_locked(slot);
         xSemaphoreGive(s_state.state_mutex);
-        ESP_LOGI(TAG, "USB device disconnected: %s", busid);
+        ESP_LOGW(TAG, "USB device disconnected: %s", busid);
         return;
     }
 
@@ -602,10 +602,6 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
         ? (pipe->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
         : (pipe->endpoint_addr & 0x80) != 0;
 
-    ESP_LOGW(TAG, "process_pipe START busid=%.32s ep=0x%02x dir=%s is_ctrl=%d",
-             pipe->busid, pipe->endpoint_addr,
-             pipe->is_in ? "IN" : "OUT", pipe->is_control);
-
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     const int dev_slot = find_slot_by_busid_locked(pipe->busid);
     if (dev_slot >= 0) {
@@ -671,7 +667,7 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
         err = usb_host_transfer_submit(transfer);
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "submit failed: %s (ep=0x%02x)",
+        ESP_LOGD(TAG, "submit failed: %s (ep=0x%02x)",
                  esp_err_to_name(err), pipe->endpoint_addr);
         usb_host_transfer_free(transfer);
         return (err == ESP_ERR_INVALID_STATE) ? -ENODEV : -EIO;
@@ -701,7 +697,7 @@ static int complete_transfer(usb_backend_pipe_req_t *pipe)
     }
 
     if (status != 0) {
-        ESP_LOGW(TAG, "transfer failed: usb_status=%d errno=%d (ep=0x%02x)",
+        ESP_LOGD(TAG, "transfer failed: usb_status=%d errno=%d (ep=0x%02x)",
                  transfer->status, status, pipe->endpoint_addr);
     }
 
@@ -732,13 +728,9 @@ static int complete_transfer(usb_backend_pipe_req_t *pipe)
         *pipe->in_len_out = 0;
     }
 
-    uint32_t actual_bytes = transfer->actual_num_bytes;
     usb_host_transfer_free(transfer);
     pipe->xfer = NULL;
 
-    ESP_LOGW(TAG, "process_pipe DONE busid=%.32s ep=0x%02x status=%d actual_bytes=%u",
-             pipe->busid, pipe->endpoint_addr, status,
-             (unsigned int)actual_bytes);
     return status;
 }
 
@@ -750,7 +742,7 @@ static void usb_backend_daemon_task(void *arg)
         uint32_t event_flags = 0;
         esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "usb_host_lib_handle_events failed: %s", esp_err_to_name(err));
+            ESP_LOGD(TAG, "usb_host_lib_handle_events failed: %s", esp_err_to_name(err));
             continue;
         }
 
@@ -780,7 +772,7 @@ static void usb_backend_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "USB backend task running (%d pipe slots)", USB_BACKEND_NUM_PIPES);
+    ESP_LOGD(TAG, "USB backend task running (%d pipe slots)", USB_BACKEND_NUM_PIPES);
 
     while (true) {
         /* Wait for a notification from a caller, or wake every 10ms to
@@ -791,7 +783,7 @@ static void usb_backend_task(void *arg)
            callbacks (pipe->completed = true). */
         err = usb_host_client_handle_events(s_state.client_hdl, 0);
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG, "usb_host_client_handle_events failed: %s", esp_err_to_name(err));
+            ESP_LOGD(TAG, "usb_host_client_handle_events failed: %s", esp_err_to_name(err));
         }
 
         process_backend_events();
@@ -829,13 +821,13 @@ static void usb_backend_task(void *arg)
             /* Detect external cancel requests. */
             if (!pipe->aborted && pipe->cancel != NULL && *pipe->cancel) {
                 pipe->aborted = true;
-                ESP_LOGW(TAG, "transfer cancelled (ep=0x%02x)", pipe->endpoint_addr);
+                ESP_LOGD(TAG, "transfer cancelled (ep=0x%02x)", pipe->endpoint_addr);
             }
 
             /* Detect software timeout (DWC hardware doesn't). */
             if (!pipe->aborted && now >= pipe->deadline) {
                 pipe->aborted = true;
-                ESP_LOGW(TAG, "transfer timed out (ep=0x%02x)", pipe->endpoint_addr);
+                ESP_LOGD(TAG, "transfer timed out (ep=0x%02x)", pipe->endpoint_addr);
             }
 
             /* If we need to abort a non-control transfer that hasn't
@@ -1051,7 +1043,7 @@ static int submit_pipe_request(const char busid[32],
         if (!found) {
             xSemaphoreGive(s_state.state_mutex);
             xSemaphoreGive(s_state.pipe_avail_sem);
-            ESP_LOGW(TAG, "Unknown endpoint 0x%02x on %s", endpoint_addr, busid);
+            ESP_LOGD(TAG, "Unknown endpoint 0x%02x on %s", endpoint_addr, busid);
             return -ENODEV;
         }
     }
